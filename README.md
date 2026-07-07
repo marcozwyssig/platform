@@ -10,8 +10,8 @@ Dev-time consumption: check this repo out as a **sibling** of the consuming prod
 ## Layout
 
 Mirrors netctl: `src/python/` (Python packages, e.g. `platformcore`) and `src/java/` (Java modules,
-Phase 2). Tests under `tests/`.
+Phase 2). Tests live under `test/python/` (unit) and `test/java/` (Phase 2).
 
 ## Test
 
-    PYTHONPATH=src/python python3 -m pytest tests -v
+    python3 -m pytest test/python/unit -v
