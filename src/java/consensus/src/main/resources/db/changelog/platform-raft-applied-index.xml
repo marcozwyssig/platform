@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+          http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- The Raft applied (term,index) ops table: written in the projection's apply transaction so the
+         persisted state and the applied index advance atomically (#189). Native-SQL, NOT a JPA entity.
+         Shipped by the platform shared-core; the product master <include>s it. logicalFilePath pins the
+         changeSet identity to its ORIGINAL master path so an existing DATABASECHANGELOG row is unchanged
+         after the physical relocation (no re-run / checksum flip). -->
+    <changeSet id="v19-raft-applied-index" author="netctl"
+               logicalFilePath="db/changelog/db.changelog-master.xml">
+        <createTable tableName="raft_applied_index">
+            <column name="group_id" type="VARCHAR(64)">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="applied_term" type="BIGINT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="applied_index" type="BIGINT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="updated_at" type="TIMESTAMP" defaultValueComputed="CURRENT_TIMESTAMP">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+    </changeSet>
+</databaseChangeLog>

@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+
+# Gradle (Java build, Phase 2) - never commit build output into the shared-core repo.
+.gradle/
+build/
