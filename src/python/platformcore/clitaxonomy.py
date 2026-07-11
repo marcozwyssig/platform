@@ -16,8 +16,23 @@ class CommandTaxonomy:
     def __init__(self, groups: dict[str, tuple[str, ...]], env_groups: frozenset[str]) -> None:
         self.groups = groups
         self.env_groups = env_groups
-        # reverse index: command name -> its group (built once from groups).
-        self.command_group: dict[str, str] = {cmd: g for g, cmds in groups.items() for cmd in cmds}
+        # multi-owner index: command name -> EVERY group that owns it, in declaration order. The same
+        # name may live in several groups (#519: `test all` next to `deploy all`); such a name is
+        # addressable only via its group token and has no flat form.
+        self.command_groups: dict[str, tuple[str, ...]] = {}
+        for g, cmds in groups.items():
+            for cmd in cmds:
+                self.command_groups[cmd] = (*self.command_groups.get(cmd, ()), g)
+        # flat reverse index: command name -> its group, for UNAMBIGUOUS names only. An ambiguous name
+        # is deliberately absent, so resolve_group() treats its bare token as unknown and a CLI knows
+        # not to register a flat alias for it.
+        self.command_group: dict[str, str] = {
+            cmd: gs[0] for cmd, gs in self.command_groups.items() if len(gs) == 1
+        }
+
+    def is_ambiguous(self, name: str) -> bool:
+        """True iff the command name is owned by MORE than one group (so it has no flat form)."""
+        return len(self.command_groups.get(name, ())) > 1
 
     def group_requires_env(self, group: str) -> bool:
         """True iff the group is one of the env-first CD groups."""

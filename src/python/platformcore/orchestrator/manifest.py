@@ -40,7 +40,8 @@ class Manifest(NamedTuple):
     """A parsed, validated product manifest: the command taxonomy (group -> its command names, and the
     subset of env-first groups) plus each command's spec. `groups` and `env_groups` already have the exact
     shape the shared CommandTaxonomy consumes, so `taxonomy()` builds the env-gate without duplicating its
-    logic.
+    logic. `commands` keeps the spec keys AS DECLARED - plain (`up`) or group-scoped (`deploy.all`, #519);
+    resolve a member's spec through `spec_for`, which knows the scoped-first precedence.
     """
     groups: dict[str, tuple[str, ...]]
     env_groups: frozenset[str]
@@ -49,6 +50,13 @@ class Manifest(NamedTuple):
     def taxonomy(self) -> CommandTaxonomy:
         """The shared env-gate engine built from this manifest's taxonomy (one env-gate, not a copy)."""
         return CommandTaxonomy(self.groups, self.env_groups)
+
+    def spec_for(self, group: str, name: str) -> CommandSpec:
+        """The spec for a group member: its group-scoped declaration (`<group>.<name>`) when present,
+        else the plain one. load() guarantees every member resolves (and that a name owned by several
+        groups is declared scoped per owner), so this lookup cannot miss on a validated manifest."""
+        scoped = self.commands.get(f"{group}.{name}")
+        return scoped if scoped is not None else self.commands[name]
 
 
 def _split_impl(impl: str, context: str) -> tuple[str, str]:
@@ -91,14 +99,12 @@ def load(text: str) -> Manifest:
             raise ValueError(f"env_groups entry '{g}' is not a declared group")
     env_groups = frozenset(env_groups_names)
 
-    # reverse index; a command in two groups is a taxonomy error.
-    command_group: dict[str, str] = {}
+    # multi-owner reverse index: the SAME name may live in several groups (#519), in which case every
+    # owner must declare a group-scoped spec (validated below) and the name loses its flat form.
+    command_groups: dict[str, list[str]] = {}
     for group, members in groups.items():
         for cmd in members:
-            if cmd in command_group:
-                raise ValueError(
-                    f"command '{cmd}' is in more than one group ('{command_group[cmd]}' and '{group}')")
-            command_group[cmd] = group
+            command_groups.setdefault(cmd, []).append(group)
 
     raw_commands = data.get("commands") or {}
     commands: dict[str, CommandSpec] = {}
@@ -115,13 +121,32 @@ def load(text: str) -> Manifest:
         commands[name] = CommandSpec(impl=impl, help=help_text,
                                      passthrough_args=bool(spec.get("passthrough_args", False)))
 
-    # membership and specs must agree, both ways.
-    missing_spec = sorted(c for c in command_group if c not in commands)
+    # membership and specs must agree, both ways. A spec key is either a plain command name or a
+    # group-scoped `<group>.<name>` (#519); a name owned by SEVERAL groups must be declared scoped
+    # per owner (a lone plain spec would be ambiguous), and every scoped key must point at a real
+    # member of that group.
+    missing_spec = sorted(
+        c for c, owners in command_groups.items()
+        if any(c not in commands and f"{g}.{c}" not in commands for g in owners))
     if missing_spec:
         raise ValueError(f"commands declared in a group but missing a spec: {missing_spec}")
-    orphan_spec = sorted(c for c in commands if c not in command_group)
-    if orphan_spec:
-        raise ValueError(f"commands with a spec but not in any declared group: {orphan_spec}")
+    ambiguous_plain = sorted(
+        c for c, owners in command_groups.items()
+        if len(owners) > 1 and any(f"{g}.{c}" not in commands for g in owners))
+    if ambiguous_plain:
+        raise ValueError(
+            f"commands owned by several groups need a group-scoped spec per owner "
+            f"('<group>.<name>'): {ambiguous_plain}")
+    orphans: list[str] = []
+    for key in commands:
+        group, sep, name = key.partition(".")
+        if sep and group in groups:
+            if name not in groups[group]:
+                raise ValueError(f"scoped spec '{key}': '{name}' is not a member of group '{group}'")
+        elif key not in command_groups:
+            orphans.append(key)
+    if orphans:
+        raise ValueError(f"commands with a spec but not in any declared group: {sorted(orphans)}")
 
     return Manifest(groups=groups, env_groups=env_groups, commands=commands)
 
