@@ -77,13 +77,63 @@ def test_load_rejects_an_env_group_that_is_not_a_declared_group():
         manifest.load(text)
 
 
-def test_load_rejects_a_command_listed_in_two_groups():
-    # arrange: `up` appears in both deploy and operate
+# A name owned by two groups, each with its own GROUP-SCOPED spec (`<group>.<name>`) - the #519 shape
+# (netctl: `test all` runs every test stage, `deploy all` stays the full e2e bring-up).
+_DUPLICATE_OK = """
+groups:
+  test:   [unit, all]
+  deploy: [up, all]
+env_groups: [deploy]
+commands:
+  unit:       { impl: "demo.impls:unit", help: "Unit gate." }
+  up:         { impl: "demo.impls:up",   help: "Deploy up." }
+  test.all:   { impl: "demo.impls:test_all",   help: "Run every test stage." }
+  deploy.all: { impl: "demo.impls:deploy_all", help: "Full e2e bring-up." }
+"""
+
+
+def test_load_accepts_a_duplicated_name_when_every_owner_declares_a_scoped_spec():
+    # arrange / act
+    mf = manifest.load(_DUPLICATE_OK)
+
+    # assert: each group resolves ITS spec; unique names still resolve via their plain spec
+    assert mf.spec_for("test", "all").impl == "demo.impls:test_all"
+    assert mf.spec_for("deploy", "all").impl == "demo.impls:deploy_all"
+    assert mf.spec_for("test", "unit").impl == "demo.impls:unit"
+
+
+def test_spec_for_prefers_a_scoped_spec_over_a_plain_one():
+    # arrange: `unit` has a plain spec AND a test-scoped override
+    text = ("groups:\n  test: [unit]\ncommands:\n"
+            "  unit:      { impl: 'm:plain',  help: 'x' }\n"
+            "  test.unit: { impl: 'm:scoped', help: 'x' }\n")
+
+    # act
+    mf = manifest.load(text)
+
+    # assert
+    assert mf.spec_for("test", "unit").impl == "m:scoped"
+
+
+def test_load_rejects_a_duplicated_name_with_only_a_plain_spec():
+    # arrange: `up` appears in both deploy and operate but has ONE unscoped spec - ambiguous
     text = ("groups:\n  deploy: [up]\n  operate: [up]\n"
             "commands:\n  up: { impl: 'm:f', help: 'x' }\n")
 
+    # act / assert: the error demands group-scoped specs
+    with pytest.raises(ValueError, match="group-scoped"):
+        manifest.load(text)
+
+
+def test_load_rejects_a_scoped_spec_whose_command_is_not_in_that_group():
+    # arrange: `deploy.fmt` is scoped to deploy, but fmt is a code member
+    text = ("groups:\n  code: [fmt]\n  deploy: [up]\ncommands:\n"
+            "  fmt:        { impl: 'm:f', help: 'x' }\n"
+            "  up:         { impl: 'm:f', help: 'x' }\n"
+            "  deploy.fmt: { impl: 'm:f', help: 'x' }\n")
+
     # act / assert
-    with pytest.raises(ValueError, match="more than one group"):
+    with pytest.raises(ValueError, match="not a member"):
         manifest.load(text)
 
 
