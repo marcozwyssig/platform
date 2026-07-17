@@ -13,7 +13,7 @@ the product repo, not here.
 
 ## HARD naming rule
 
-Python import package: `platformcore`. NEVER `platform` — that name shadows the Python stdlib
+Python import package: `delivery`. NEVER `platform` — that name shadows the Python stdlib
 module. Java group: `info.zwyssig.platform`. Both are enforced in existing code; do not widen.
 
 ## Layout
@@ -27,7 +27,7 @@ src/consensus/                     Java lib block
                                    appliedIndex JPA persistence (standard src/main inside)
   test/unit/java/                  JUnit tests (+ resources/)
 src/delivery/                      Python lib block
-  src/python/platformcore/         Python shared core
+  src/python/delivery/             Python shared core
     orchestrator/                  steps runner + TUI + manifest assembly
     (clitaxonomy, environments, degraded, disk, diskguard, host, interact, log, run, vcs, waits)
   test/unit/python/                pytest unit tests (conftest.py adds the block's src/python to

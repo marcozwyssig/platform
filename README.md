@@ -6,7 +6,7 @@ netctl: `docs/superpowers/specs/2026-07-07-platform-core-extraction-infractl-boo
 Consumption: the products vendor this repo as a **git submodule at `lib/platform`**. The product's
 shim and pytest bootstrap prepend `lib/platform/src/delivery/src/python` to `sys.path` /
 `PYTHONPATH`; Java is consumed via a Gradle composite (`includeBuild("lib/platform")`, coordinates
-`info.zwyssig.platform:consensus`). Python import package: `platformcore` (never `platform` - that
+`info.zwyssig.platform:consensus`). Python import package: `delivery` (never `platform` - that
 name shadows the Python stdlib module).
 
 ## Layout
@@ -19,7 +19,7 @@ src/consensus/                     Java lib block: Raft wiring, mTLS material, a
   src/java/                        Gradle module :consensus (group info.zwyssig.platform)
   test/unit/java/                  JUnit tests (+ resources/)
 src/delivery/                      Python lib block: the CI/CD orchestrator engine + seams
-  src/python/platformcore/         import package (orchestrator/, clitaxonomy, environments, ...)
+  src/python/delivery/             import package (orchestrator/, clitaxonomy, environments, ...)
   test/unit/python/                pytest unit tests (conftest.py adds src/python to sys.path)
 ```
 
