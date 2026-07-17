@@ -1,0 +1,22 @@
+# Minimal CI (netctl#592 decision 7): pytest over the delivery block. The consensus Java module has
+# no wrapper checked in and is exercised by the consumers' CI (Gradle composite via lib/platform),
+# so the Java gate stays consumer-side for now.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install test dependencies
+        run: pip install pytest pyyaml textual
+      - name: Run the delivery unit tests
+        run: python -m pytest src/delivery/test/unit/python -v

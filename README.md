@@ -3,15 +3,27 @@
 Domain-agnostic shared core for the `*ctl` product family (netctl, infractl). See the design spec in
 netctl: `docs/superpowers/specs/2026-07-07-platform-core-extraction-infractl-bootstrap-design.md`.
 
-Dev-time consumption: check this repo out as a **sibling** of the consuming product
-(`<parent>/platform` next to `<parent>/netctl`). The product's shim and pytest bootstrap prepend
-`platform/src/python` to `sys.path`. Python import package: `platformcore` (never `platform`).
+Consumption: the products vendor this repo as a **git submodule at `lib/platform`**. The product's
+shim and pytest bootstrap prepend `lib/platform/src/delivery/src/python` to `sys.path` /
+`PYTHONPATH`; Java is consumed via a Gradle composite (`includeBuild("lib/platform")`, coordinates
+`info.zwyssig.platform:consensus`). Python import package: `delivery` (never `platform` - that
+name shadows the Python stdlib module).
 
 ## Layout
 
-Mirrors netctl: `src/python/` (Python packages, e.g. `platformcore`) and `src/java/` (Java modules,
-Phase 2). Tests live under `test/python/` (unit) and `test/java/` (Phase 2).
+arc42 building blocks under `src/` (platform#2, mirrors netctl#548): each block owns its code and
+tests, with the language level inside the block and the test LEVEL on top.
+
+```
+src/consensus/                     Java lib block: Raft wiring, mTLS material, appliedIndex JPA
+  src/java/                        Gradle module :consensus (group info.zwyssig.platform)
+  test/unit/java/                  JUnit tests (+ resources/)
+src/delivery/                      Python lib block: the CI/CD orchestrator engine + seams
+  src/python/delivery/             import package (orchestrator/, clitaxonomy, environments, ...)
+  test/unit/python/                pytest unit tests (conftest.py adds src/python to sys.path)
+```
 
 ## Test
 
-    python3 -m pytest test/python/unit -v
+    python3 -m pytest src/delivery/test/unit/python -v
+    gradle :consensus:test
