@@ -18,20 +18,27 @@ module. Java group: `info.zwyssig.platform`. Both are enforced in existing code;
 
 ## Layout
 
+arc42 building blocks under `src/` (platform#2, mirrors netctl#548): each block owns code + tests,
+language level inside the block, test LEVEL on top.
+
 ```
-src/python/platformcore/           Python shared core
-  orchestrator/                    steps runner + TUI + manifest assembly
-  (clitaxonomy, environments, degraded, disk, diskguard, host, interact, log, run, vcs, waits)
-src/java/
-  consensus/                       Raft wiring, mTLS material, appliedIndex JPA persistence
-test/python/unit/                  pytest unit tests (conftest.py adds src/python to sys.path)
-test/java/consensus/               JUnit tests for the consensus module
+src/consensus/                     Java lib block
+  src/java/                        Gradle module :consensus - Raft wiring, mTLS material,
+                                   appliedIndex JPA persistence (standard src/main inside)
+  test/unit/java/                  JUnit tests (+ resources/)
+src/delivery/                      Python lib block
+  src/python/platformcore/         Python shared core
+    orchestrator/                  steps runner + TUI + manifest assembly
+    (clitaxonomy, environments, degraded, disk, diskguard, host, interact, log, run, vcs, waits)
+  test/unit/python/                pytest unit tests (conftest.py adds the block's src/python to
+                                   sys.path)
 ```
 
 ## Consumption model
 
 Both products vendor this repo as a **git submodule at `lib/platform`**:
-- Python: `lib/platform/src/python` prepended to `sys.path` (or `PYTHONPATH`) by product conftest/shim.
+- Python: `lib/platform/src/delivery/src/python` prepended to `sys.path` (or `PYTHONPATH`) by
+  product conftest/shim.
 - Java: Gradle composite `includeBuild("lib/platform")` in the product's settings; module name
   `:consensus` (group `info.zwyssig.platform`, artifact `consensus`).
 
@@ -49,16 +56,16 @@ Exhaustiveness is product-side and load-bearing. Do not seal `ReplicatedEvent` h
 
 ```
 # Python (run from repo root)
-python3 -m pytest test/python/unit -v
+python3 -m pytest src/delivery/test/unit/python -v
 
-# Java
-./gradlew :consensus:build          # compile + test the consensus module
-./gradlew :consensus:test           # tests only
+# Java (no wrapper checked in; use a local Gradle or the docker gradle:jdk25 image)
+gradle :consensus:build             # compile + test the consensus module
+gradle :consensus:test              # tests only
 ```
 
-Java builds use Gradle wrapper (`./gradlew`); JDK 25, Spring Boot 4.0.x, Ratis 3.1.3 (same
-versions as netctl's infrastructure module — keep in sync). Tests use H2 in-memory, Liquibase
-changelog at `src/main/resources/db/changelog/platform-raft-applied-index.xml`.
+Java builds need Gradle 9 + JDK 25; Spring Boot 4.0.x, Ratis 3.1.3 (same versions as netctl's
+infrastructure module — keep in sync). Tests use H2 in-memory, Liquibase changelog at
+`src/consensus/src/java/src/main/resources/db/changelog/platform-raft-applied-index.xml`.
 
 ## Conventions
 

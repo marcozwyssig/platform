@@ -24,7 +24,7 @@
 #   mirroring the OpenBao model: only the issued leaf key is held by the node.
 #
 # HOW TO RUN
-#   test/java/unit/infrastructure/resources/tls/gen-tls-fixtures.sh
+#   src/consensus/test/unit/java/resources/tls/gen-tls-fixtures.sh
 #   Requires OpenSSL 3.x (-addext, rsa -traditional, pkcs8 -topk8). Re-running overwrites
 #   the 7 fixtures in place; the cert STRUCTURE is deterministic, only the random keys differ per run.
 #

@@ -42,7 +42,9 @@ tasks.withType<Test>().configureEach {
 
 sourceSets {
     test {
-        java.setSrcDirs(listOf(file("../../../test/java/consensus")))
-        resources.setSrcDirs(listOf(file("../../../test/java/consensus/resources")))
+        // Tests live level-on-top inside the consensus block (src/consensus/test/unit/java),
+        // outside the Gradle module dir (src/consensus/src/java); point the test sourceSet there.
+        java.setSrcDirs(listOf(file("../../test/unit/java")))
+        resources.setSrcDirs(listOf(file("../../test/unit/java/resources")))
     }
 }
