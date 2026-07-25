@@ -17,6 +17,6 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install test dependencies
-        run: pip install pytest pyyaml textual
+        run: pip install pytest pyyaml textual "pydantic==2.13.4"
       - name: Run the delivery unit tests
         run: python -m pytest src/delivery/test/unit/python -v
