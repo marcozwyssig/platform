@@ -3,6 +3,9 @@
 Domain-agnostic shared core for the `*ctl` product family (netctl, infractl). See the design spec in
 netctl: `docs/superpowers/specs/2026-07-07-platform-core-extraction-infractl-bootstrap-design.md`.
 
+**Adopting the platform for a new product?** One command: `./init-product.sh <name>`. See
+[`docs/adopting-the-platform.md`](docs/adopting-the-platform.md).
+
 Consumption: the products vendor this repo as a **git submodule at `lib/platform`**. The product's
 shim and pytest bootstrap prepend `lib/platform/src/delivery/src/python` to `sys.path` /
 `PYTHONPATH`; Java is consumed via a Gradle composite (`includeBuild("lib/platform")`, coordinates

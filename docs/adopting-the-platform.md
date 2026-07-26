@@ -7,10 +7,37 @@ launcher. Your product ships **data + a thin adapter**: one manifest, one shim, 
 `orchestrator` package with your command implementations. The invariant the kernel is built around
 is *"gleiche Maschine, anderer Katalog"* — same machine, different catalog.
 
-This guide centers on `python -m delivery.bootstrap`, the scaffolder that writes a working
-skeleton, and uses **netctl** (this repo, at `deploy/provision/orchestrator/`) as the worked
-example. Every path and API below is real kernel code under
-`lib/platform/src/delivery/src/python/delivery/`.
+Adopting the platform is **one command** - `./init-product.sh <name>` (see the Quickstart just
+below). Under it sits `python -m delivery.bootstrap`, the scaffolder that writes the working skeleton;
+this guide documents both, plus the seams a product grows into, using **netctl** (this repo, at
+`deploy/provision/orchestrator/`) as the worked example. Every path and API below is real kernel code
+under `lib/platform/src/delivery/src/python/delivery/`.
+
+---
+
+## Quickstart: one command
+
+For a brand-new product the entire adoption is a single script, `init-product.sh` at the platform
+repo root (netctl#740). Grab it standalone - the platform submodule does not exist yet, so you cannot
+run anything *through* it - then run it with your product name:
+
+```bash
+# from your new product repo root
+curl -fsSL https://raw.githubusercontent.com/marcozwyssig/platform/main/init-product.sh -o init-product.sh
+chmod +x init-product.sh
+./init-product.sh myctl
+```
+
+It runs the whole flow end to end and leaves a working CLI:
+
+1. `git init` if the directory is not a repo yet;
+2. `git submodule add … lib/platform` - vendor the platform at the conventional path;
+3. `python -m delivery.bootstrap myctl` - scaffold the shim, `myctl.yaml` and the `orchestrator` package;
+4. verify by actually running `./myctl.sh help`.
+
+When it prints `OK`, the only work left is filling in `myctl.yaml`. Overrides (env vars):
+`PLATFORM_URL`, `PLATFORM_REF`, `PLATFORM_PATH`. The rest of this guide explains what the script sets
+up and the seams you then extend; §2 is that same scaffold step run by hand.
 
 ---
 
@@ -55,17 +82,18 @@ It writes exactly these 8 files (`delivery.bootstrap._templates`):
 ```
 fooctl.sh                                         # the shim onto lib/platform's launch.sh (0o755)
 fooctl.yaml                                        # the starter manifest (validates through manifest.load)
-orchestrator/requirements.txt                      # host-venv deps
+orchestrator/requirements.txt                      # host-venv deps: -r the kernel + product-only pins (#730)
 orchestrator/src/python/orchestrator/
     __init__.py                                    # the product package
     __main__.py                                    # `python -m orchestrator` entry
-    cli.py                                          # composition root: root Typer app + assemble + main
-    paths.py                                        # ProductContext wiring (delivery.context)
+    cli.py                                          # composition root: impls + assemble + main + the `all` composite
+    paths.py                                        # ProductContext wiring; root via a manifest-marker walk
     environments.py                                # EnvironmentProvider (backends + env-gate)
 ```
 
 The package is **always** named `orchestrator` (mirroring netctl), so a hyphenated product slug never
-has to be a Python identifier. Then, per the printed next-steps:
+has to be a Python identifier. Then, per the printed next-steps (exactly what `init-product.sh`
+automates):
 
 ```bash
 cd fooctl
@@ -150,9 +178,17 @@ scaffolded `paths.py`:
 ```python
 from delivery import context
 
-# <root>/orchestrator/src/python/orchestrator/paths.py → root is FOUR parents up
-_DERIVED_ROOT = Path(__file__).resolve().parents[4]
-_DERIVED_MANIFEST = _DERIVED_ROOT / "fooctl.yaml"
+# The manifest doubles as the repo-root MARKER: walk up from this file to the dir holding fooctl.yaml.
+_MANIFEST_NAME = "fooctl.yaml"
+
+def _find_root(start: Path, marker: str) -> Path:
+    for candidate in (start, *start.parents):
+        if (candidate / marker).is_file():
+            return candidate
+    raise RuntimeError(f"fooctl: cannot locate '{marker}' walking up from {start}")
+
+_DERIVED_ROOT = _find_root(Path(__file__).resolve().parent, _MANIFEST_NAME)
+_DERIVED_MANIFEST = _DERIVED_ROOT / _MANIFEST_NAME
 
 CONTEXT = context.set_current(
     context.ProductContext.resolve("fooctl", _DERIVED_ROOT, _DERIVED_MANIFEST))
@@ -162,10 +198,10 @@ MANIFEST = CONTEXT.manifest_path
 
 `.resolve()` lets the kernel env vars `DELIVERY_PRODUCT_ROOT` / `DELIVERY_MANIFEST` override the
 derived defaults (a relocated checkout, a test fixture tree); with neither set the UX is byte-
-identical. The `parents[N]` depth is **layout-dependent**: the scaffold uses `[4]`
-(`<root>/orchestrator/…`); netctl relocated the block under `deploy/provision/orchestrator/`, so its
-real `paths.py` uses `parents[6]` and reads the manifest at `parents[3]`. Adjust `N` if you move the
-package.
+identical. Root detection is a **marker-walk**, not a fixed parent depth (netctl#737): it climbs to
+the directory that holds `<product>.yaml`, so relocating the `orchestrator` package deeper in the tree
+(as netctl did to `deploy/provision/orchestrator/`) needs no hand-edit. Keep the manifest at the repo
+root and the walk always finds it.
 
 ### 4b. `EnvironmentProvider` — the environments seam (`environments.py`)
 
@@ -238,26 +274,35 @@ def main() -> None:                           # `python -m orchestrator`
 You may register product-only internal commands on `app` with `@app.command` **before** `assemble`;
 netctl does this for `_up`/`disk-guard`/`wireguard-guard`.
 
-### 4e. The composite step-factory seam (only if you use composites)
+### 4e. The composite step-factory seam
 
-Composites are declared as data but **not** auto-wired by `assemble`. To run one, build a
-`delivery.orchestrator.product.ProductContext` (a **distinct** type from `delivery.context`'s — it
-carries a command-name → `Step` factory) and call `run_composite`. netctl's factory (`steps.py`):
-
-```python
-from delivery.orchestrator.product import ProductContext
-# a command NAME → a live-streamed `./netctl.sh <cmd>` step, labelled from the manifest
-NETCTL_CONTEXT = ProductContext("netctl", lambda cmd: shell_step(manifest_label(cmd), [cmd]))
-```
-
-and a command invokes it:
+Composites are declared as data and are **not** auto-wired by `assemble` - a command has to invoke
+`run_composite`. The scaffolder now models a WORKING starter (netctl#737): `cli.py` builds a
+`delivery.orchestrator.product.StepFactoryContext` (a **distinct** type from `delivery.context`'s
+identity context - it carries a command-name → `Step` factory) plus an `all` command that runs it, so
+`fooctl all` runs the `build → up` composite out of the box:
 
 ```python
-raise typer.Exit(product.run_composite("bringup", paths.CONTEXT.manifest(), steps.NETCTL_CONTEXT))
+from delivery.orchestrator.product import StepFactoryContext, run_composite
+from delivery.orchestrator.steps import argv_step
+
+# a command NAME → a live-streamed `./fooctl.sh <cmd>` step
+_STEP_CONTEXT = StepFactoryContext("fooctl", lambda cmd: argv_step(cmd, [str(paths.ROOT / "fooctl.sh"), cmd]))
+
+def all_cmd() -> None:                              # the impl of the manifest's deploy.all command
+    raise typer.Exit(run_composite("all", paths.CONTEXT.manifest(), _STEP_CONTEXT))
 ```
 
-`run_composite` maps each step name through your factory into a `Step`, wraps them in a `Pipeline`
-carrying `stop_on_failure`, and dispatches through the shared TUI runner (headless fallback).
+Add your own composites by declaring them in the manifest and pointing a command's `impl` at a
+callable that calls `run_composite("<name>", …)`. netctl's factory labels each step from the manifest
+(`steps.py`: `StepFactoryContext("netctl", lambda cmd: shell_step(manifest_label(cmd), [cmd]))`) and
+its `bringup` / `test all` commands invoke it. `run_composite` maps each step name through your factory
+into a `Step`, wraps them in a `Pipeline` carrying `stop_on_failure`, and dispatches through the shared
+TUI runner (headless fallback).
+
+> The type was named `ProductContext` before netctl#737 and collided with
+> `delivery.context.ProductContext`; it is now `StepFactoryContext`, with a back-compat `ProductContext`
+> alias kept until consumers migrate.
 
 ---
 
@@ -265,21 +310,21 @@ carrying `stop_on_failure`, and dispatches through the shared TUI runner (headle
 
 Since #730 the kernel **owns** its dependency pins in `lib/platform/src/delivery/requirements.txt`
 (typer, click, PyYAML, rich, textual, pydantic). Your product's `orchestrator/requirements.txt`
-references it with `-r` and adds ONLY product deps, so a kernel bump lands in one place. netctl's
-file (the reference form):
+references it with `-r` and adds ONLY product deps, so a kernel bump lands in one place. The
+scaffolder emits this out of the box (netctl#737) - it no longer re-pins the kernel deps inline:
 
 ```
-# pip resolves the -r path relative to THIS file
--r ../../../lib/platform/src/delivery/requirements.txt
+# scaffolded orchestrator/requirements.txt (pip resolves the -r path relative to THIS file)
+-r ../lib/platform/src/delivery/requirements.txt
 # --- product-only deps ---
-requests==2.34.2
-jinja2==3.1.4
-cryptography==43.0.1
+# add your own here
 ```
 
-The `../` count is layout-dependent (netctl's `orchestrator/requirements.txt` sits three dirs below
-root under `deploy/provision/`; the scaffold layout sits one dir below root, so it would use
-`-r ../lib/platform/src/delivery/requirements.txt`). `launch.sh` runs
+The `../` count matches the orchestrator-dir depth: the scaffold's `<root>/orchestrator/` layout uses
+one `../`; netctl relocated the block three dirs below root under `deploy/provision/`, so its file
+uses `-r ../../../lib/platform/src/delivery/requirements.txt` plus `requests` / `jinja2` /
+`cryptography`. It is the one path to re-tune if you move the orchestrator dir (the Python side
+self-locates via the marker-walk; this static pip file cannot). `launch.sh` runs
 `pip install -r orchestrator/requirements.txt` into a host venv whenever the file is newer than its
 stamp.
 
@@ -288,16 +333,15 @@ stamp.
 ## 6. A minimal end-to-end "hello product" walkthrough
 
 ```bash
-# 1. scaffold
-PYTHONPATH=lib/platform/src/delivery/src/python python -m delivery.bootstrap fooctl
-cd fooctl && git init
-git submodule add https://github.com/marcozwyssig/platform.git lib/platform
+# 1. scaffold + vendor + verify, one command
+./init-product.sh fooctl        # or by hand: PYTHONPATH=… python -m delivery.bootstrap fooctl + submodule add
 
 # 2. run the generated CLI (first run bootstraps the host venv via launch.sh)
-./fooctl.sh help              # lists: build (CI panel), deploy up/down (CD panel)
+./fooctl.sh help              # lists: build (CI panel), deploy up/down/all (CD panel)
 ./fooctl.sh build             # → orchestrator.cli:build placeholder
 ./fooctl.sh up                # flat alias == `./fooctl.sh dev deploy up`
 ./fooctl.sh dev deploy up     # explicit env-first form
+./fooctl.sh all               # runs the build → up composite (StepFactoryContext + run_composite)
 ./fooctl.sh build --instance …  # ✗ agnostic group rejects an env / a non-env prefix
 ```
 
@@ -319,28 +363,26 @@ def status() -> None:
 ```
 
 `./fooctl.sh dev deploy status` (and the flat `./fooctl.sh status`) now dispatch — no kernel change,
-no re-registration. The manifest is the surface; `cli.py` holds the callables. To make the declared
-`all` composite runnable, add a `steps.py` with a `product.ProductContext` factory and a command that
-calls `run_composite("all", …)` (see §4e).
+no re-registration. The manifest is the surface; `cli.py` holds the callables. The starter `all`
+composite is already wired (`./fooctl.sh all` runs build → up); add your own composites the same way
+(see §4e).
 
 ---
 
-## Gaps found (seams under-documented / not scaffolded in code)
+## Resolved: the four scaffolder gaps (netctl#737)
 
-- **The scaffold re-pins deps inline; #730 says use `-r`.** `bootstrap._REQUIREMENTS` emits the six
-  kernel pins verbatim into `orchestrator/requirements.txt` rather than `-r`-referencing
-  `lib/platform/src/delivery/requirements.txt`. So a freshly bootstrapped product does NOT follow the
-  current netctl convention and will drift from the kernel's pins. Convert it to the `-r` form after
-  scaffolding.
-- **The scaffolded `all` composite is declared but unreachable.** `bootstrap` emits
-  `composites.all` in the manifest, but the generated `cli.py` wires no step factory and no
-  `run_composite` call — `assemble`/`main` never touch composites. The composite-runner seam
-  (`delivery.orchestrator.product.ProductContext` + a `steps.py`) must be added by hand; the
-  scaffolder does not model it, and its own docstring lists a richer scaffolder as deferred.
-- **`parents[N]` depth is a silent layout coupling.** Both `paths.py` (`parents[4]`) and the
-  requirements `-r` path assume the scaffold's `<root>/orchestrator/…` layout. Relocating the package
-  (as netctl did to `deploy/provision/orchestrator/`, needing `parents[6]`/`parents[3]`) requires
-  hand-editing both, with no helper or check to catch a wrong count.
-- **The two `ProductContext` types collide by name.** `delivery.context.ProductContext` (identity)
-  and `delivery.orchestrator.product.ProductContext` (composite step factory) are distinct classes
-  with the same name; only a docstring note disambiguates them. Easy to confuse when wiring §4e.
+This guide originally surfaced four seams that were under-documented or not scaffolded in code. All
+four are now fixed in the scaffolder, so a freshly bootstrapped product is correct out of the box:
+
+- **Deps via `-r`, not inline pins.** `orchestrator/requirements.txt` now `-r`-references
+  `lib/platform/src/delivery/requirements.txt` and carries only product deps (§5), so a new product
+  follows the #730 convention from the start instead of re-pinning the six kernel deps.
+- **The `all` composite is wired, not dead.** The scaffolded `cli.py` builds a `StepFactoryContext`
+  and an `all_cmd` that calls `run_composite`, and `deploy.all` in the manifest points at it, so
+  `fooctl all` runs the `build → up` pipeline through the shared runner (§4e).
+- **Root detection is a marker-walk.** `paths.py` climbs to the directory holding `<product>.yaml`
+  instead of a hardcoded `parents[N]`, so relocating the orchestrator dir needs no hand-edit (§4a).
+  (The requirements `-r` `../` count stays layout-relative - a static pip file cannot self-locate.)
+- **The `ProductContext` name clash is gone.** The composite step-factory type is now
+  `StepFactoryContext` (a back-compat `ProductContext` alias remains until consumers migrate), distinct
+  from the identity `delivery.context.ProductContext` (§4e).
