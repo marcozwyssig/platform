@@ -17,6 +17,9 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install test dependencies
-        run: pip install pytest pyyaml textual "pydantic==2.13.4"
+        # The full delivery test dep set (mirrors netctl's unit-py requirements): the S1/S2 topology +
+        # clabrender tests need jinja2 + cryptography, test_cli needs click/typer (click pinned <8.2 for
+        # typer 0.12.5's make_metavar signature). Without these the collection errored on those modules.
+        run: pip install pytest pyyaml textual "pydantic==2.13.4" jinja2 cryptography "typer==0.12.5" "click==8.1.7"
       - name: Run the delivery unit tests
         run: python -m pytest src/delivery/test/unit/python -v
