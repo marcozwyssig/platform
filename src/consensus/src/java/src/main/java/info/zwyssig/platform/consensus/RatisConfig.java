@@ -41,8 +41,8 @@ import java.util.concurrent.TimeUnit;
 public class RatisConfig {
 
 
-    private static RaftPeer peer(String spec) {
-        // spec = "id:host:port"
+    // Package-private for RatisConfigPeerTest (#772): spec = "id:host:port" or "id:[v6]:port".
+    static RaftPeer peer(String spec) {
         String[] p = spec.split(":", 2);
         return RaftPeer.newBuilder().setId(p[0]).setAddress(p[1]).build();
     }
