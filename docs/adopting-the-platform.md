@@ -2,7 +2,7 @@
 
 The `delivery` kernel is the product-agnostic shared core for the `*ctl` family (netctl =
 network automation, infractl = IaaS/PaaS). It ships **mechanism only**: the manifest-driven CLI
-assembly, the env-first dispatch, the step/composite runner + split-pane TUI, and the host-venv
+assembly, the env-first dispatch, the step runner + split-pane TUI, and the host-venv
 launcher. Your product ships **data + a thin adapter**: one manifest, one shim, and a small
 `orchestrator` package with your command implementations. The invariant the kernel is built around
 is *"gleiche Maschine, anderer Katalog"* — same machine, different catalog.
@@ -51,7 +51,7 @@ up and the seams you then extend; §2 is that same scaffold step run by hand.
 | Command taxonomy / env-gate | `delivery.clitaxonomy.CommandTaxonomy` (pure) | (none — derived from your manifest) |
 | Env registry types | `delivery.environments` — `Environment`, `Registry`, `parse_data` | Supply valid backend names + the gate |
 | Product identity seam | `delivery.context.ProductContext` / `set_current` / `current` | Register one context in `paths.py` |
-| Composite runner | `delivery.orchestrator.product.run_composite` + `steps` (`Step`/`Pipeline`/`dispatch`) + `tui` | Supply a command→`Step` factory |
+| Aggregate runner | `delivery.orchestrator.product.run_command` + `steps` (`Step`/`Pipeline`/`dispatch`) + `tui` | Supply a command→`Step` factory via `assemble(step_context=…)` |
 | Host-venv bootstrap | `src/delivery/src/sh/launch.sh` — ensurepip probe, venv, `pip install -r`, `exec python -m` | A ~5-line shim that sets 4 env vars |
 | Kernel dependencies | `src/delivery/requirements.txt` (owns typer/click/pyyaml/pydantic/rich/textual, #730) | `-r` it + add product-only deps |
 
@@ -86,7 +86,7 @@ orchestrator/requirements.txt                      # host-venv deps: -r the kern
 orchestrator/src/python/orchestrator/
     __init__.py                                    # the product package
     __main__.py                                    # `python -m orchestrator` entry
-    cli.py                                          # composition root: impls + assemble + main + the `all` composite
+    cli.py                                          # composition root: impls + assemble (step_context) + main
     paths.py                                        # ProductContext wiring; root via a manifest-marker walk
     environments.py                                # EnvironmentProvider (backends + env-gate)
 ```
@@ -125,33 +125,38 @@ groups:                                            # the ONE command tree, along
   deploy:                                          # ...a multi-member, env-first CD group
     up:   { impl: "orchestrator.cli:up",   help: "Deploy to the target environment." }
     down: { impl: "orchestrator.cli:down", help: "Tear the deployment down." }
+    all:                                           # an impl-less AGGREGATE (#895): no impl, only deps
+      help: "Run build then deploy up end to end."
+      depends_on: [build, up]                      # each entry names a command declared above
+      stop_on_failure: false                       # default: run every planned step, take the worst rc
 
 env_groups: [deploy]                               # the env-first CD groups (rest are agnostic)
-
-composites:                                        # named, ordered command pipelines (#456)
-  all:
-    steps: [build, up]                             # each step names a command declared above
-    stop_on_failure: false                         # default: run every step, take the worst rc
 
 default: dev                                       # the env matrix (#15, folded into one manifest #651)
 environments:
   dev: { backend: local, description: "Local development environment." }
 ```
 
-**Command spec fields** (`CommandSpec`): `impl` (`"module:function"`, required), `help` (one-line
-summary, required), and optional `passthrough_args: true` (forward unrecognised trailing args to an
-underlying tool — netctl uses it on `accept` → pytest).
+**Command spec fields** (`CommandSpec`): `help` (one-line summary, required), plus EITHER `impl`
+(`"module:function"`, a leaf) OR `depends_on` (a list of command names, an impl-less aggregate, #895) -
+never both. Optional: `passthrough_args: true` on a leaf (forward unrecognised trailing args to an
+underlying tool — netctl uses it on `accept` → pytest) and `stop_on_failure: true` on an aggregate (a
+failed plan step skips the rest).
 
 **`load()` validates loudly** (each violation is a `ValueError`):
 
 1. `groups` is non-empty;
 2. every `env_groups` entry names a declared group;
-3. every spec has a non-empty `help` and a well-formed `module:function` `impl`;
-4. every composite step names a real command.
+3. every spec has a non-empty `help` and either a well-formed `module:function` `impl` or a non-empty
+   `depends_on` - never both;
+4. every `depends_on` entry names a known, unambiguous command;
+5. the dependency graph is acyclic.
 
 Unknown **top-level** keys are ignored, which is where your product build data lives (netctl.yaml
 carries `images:`, `volumes:`, `doctoolchain_version:`, `topology:` — read raw via
-`ProductContext.manifest_data()`, never through the CLI engine).
+`ProductContext.manifest_data()`, never through the CLI engine). ONE exception: a leftover
+`composites:` key is rejected loudly - the composites concept was removed (netctl#898); declare an
+impl-less aggregate command with `depends_on` instead.
 
 **Taxonomy behaviours the shape drives** (`delivery.clitaxonomy` + `assemble`):
 
@@ -263,8 +268,10 @@ def build() -> None: ...                      # the impl callables the manifest 
 def up() -> None: ...
 def down() -> None: ...
 
-# assemble at import: binds each manifest command's callback onto `app`
-delivery_cli.assemble(app, paths.CONTEXT.manifest(), product=paths.CONTEXT.name)
+# assemble at import: binds each manifest command's callback onto `app` (step_context binds the
+# impl-less aggregates, see §4e)
+delivery_cli.assemble(app, paths.CONTEXT.manifest(), product=paths.CONTEXT.name,
+                      step_context=_STEP_CONTEXT)
 
 def main() -> None:                           # `python -m orchestrator`
     delivery_cli.main(app=app, context=paths.CONTEXT,
@@ -274,31 +281,32 @@ def main() -> None:                           # `python -m orchestrator`
 You may register product-only internal commands on `app` with `@app.command` **before** `assemble`;
 netctl does this for `_up`/`disk-guard`/`wireguard-guard`.
 
-### 4e. The composite step-factory seam
+### 4e. The aggregate step-factory seam
 
-Composites are declared as data and are **not** auto-wired by `assemble` - a command has to invoke
-`run_composite`. The scaffolder now models a WORKING starter (netctl#737): `cli.py` builds a
+An impl-less aggregate (a command with `depends_on` and no `impl`, #895) has no callable of its own -
+the kernel synthesizes it at assembly time (#896). Your product only supplies a
 `delivery.orchestrator.product.StepFactoryContext` (a **distinct** type from `delivery.context`'s
-identity context - it carries a command-name → `Step` factory) plus an `all` command that runs it, so
-`fooctl all` runs the `build → up` composite out of the box:
+identity context - it carries a command-name → `Step` factory) via `assemble(step_context=…)`, so
+`fooctl all` runs the `build → up` dependency plan out of the box:
 
 ```python
-from delivery.orchestrator.product import StepFactoryContext, run_composite
+from delivery.orchestrator.product import StepFactoryContext
 from delivery.orchestrator.steps import argv_step
 
 # a command NAME → a live-streamed `./fooctl.sh <cmd>` step
 _STEP_CONTEXT = StepFactoryContext("fooctl", lambda cmd: argv_step(cmd, [str(paths.ROOT / "fooctl.sh"), cmd]))
 
-def all_cmd() -> None:                              # the impl of the manifest's deploy.all command
-    raise typer.Exit(run_composite("all", paths.CONTEXT.manifest(), _STEP_CONTEXT))
+delivery_cli.assemble(app, paths.CONTEXT.manifest(), product=paths.CONTEXT.name,
+                      step_context=_STEP_CONTEXT)
 ```
 
-Add your own composites by declaring them in the manifest and pointing a command's `impl` at a
-callable that calls `run_composite("<name>", …)`. netctl's factory labels each step from the manifest
-(`steps.py`: `StepFactoryContext("netctl", lambda cmd: shell_step(manifest_label(cmd), [cmd]))`) and
-its `bringup` / `test all` commands invoke it. `run_composite` maps each step name through your factory
-into a `Step`, wraps them in a `Pipeline` carrying `stop_on_failure`, and dispatches through the shared
-TUI runner (headless fallback).
+Add your own aggregates by declaring impl-less `depends_on` commands in the manifest - no product
+Python per aggregate. Under the hood the synthesized callback calls
+`delivery.orchestrator.product.run_command`, which expands the name through `Manifest.plan_for`
+(transitive, deduped, each unique command once, in dependency order), maps each planned leaf through
+your factory into a `Step`, wraps them in a `Pipeline` carrying the aggregate's `stop_on_failure`, and
+dispatches through the shared TUI runner (headless fallback). `step_context` is only required when the
+manifest declares aggregates; assembly fails loudly if one is declared without it.
 
 > The type was named `ProductContext` before netctl#737 and collided with
 > `delivery.context.ProductContext`; it is now `StepFactoryContext`, with a back-compat `ProductContext`
@@ -341,7 +349,7 @@ stamp.
 ./fooctl.sh build             # → orchestrator.cli:build placeholder
 ./fooctl.sh up                # flat alias == `./fooctl.sh dev deploy up`
 ./fooctl.sh dev deploy up     # explicit env-first form
-./fooctl.sh all               # runs the build → up composite (StepFactoryContext + run_composite)
+./fooctl.sh all               # runs the build → up dependency plan (the kernel-bound aggregate)
 ./fooctl.sh build --instance …  # ✗ agnostic group rejects an env / a non-env prefix
 ```
 
@@ -364,7 +372,7 @@ def status() -> None:
 
 `./fooctl.sh dev deploy status` (and the flat `./fooctl.sh status`) now dispatch — no kernel change,
 no re-registration. The manifest is the surface; `cli.py` holds the callables. The starter `all`
-composite is already wired (`./fooctl.sh all` runs build → up); add your own composites the same way
+aggregate is already wired (`./fooctl.sh all` runs build → up); add your own aggregates the same way
 (see §4e).
 
 ---
@@ -377,12 +385,13 @@ four are now fixed in the scaffolder, so a freshly bootstrapped product is corre
 - **Deps via `-r`, not inline pins.** `orchestrator/requirements.txt` now `-r`-references
   `lib/platform/src/delivery/requirements.txt` and carries only product deps (§5), so a new product
   follows the #730 convention from the start instead of re-pinning the six kernel deps.
-- **The `all` composite is wired, not dead.** The scaffolded `cli.py` builds a `StepFactoryContext`
-  and an `all_cmd` that calls `run_composite`, and `deploy.all` in the manifest points at it, so
-  `fooctl all` runs the `build → up` pipeline through the shared runner (§4e).
+- **The `all` aggregate is wired, not dead.** The scaffolded `cli.py` builds a `StepFactoryContext`
+  and injects it via `assemble(step_context=…)`, and `deploy.all` in the manifest is an impl-less
+  `depends_on: [build, up]` aggregate, so `fooctl all` runs the `build → up` pipeline through the
+  shared runner (§4e).
 - **Root detection is a marker-walk.** `paths.py` climbs to the directory holding `<product>.yaml`
   instead of a hardcoded `parents[N]`, so relocating the orchestrator dir needs no hand-edit (§4a).
   (The requirements `-r` `../` count stays layout-relative - a static pip file cannot self-locate.)
-- **The `ProductContext` name clash is gone.** The composite step-factory type is now
+- **The `ProductContext` name clash is gone.** The step-factory type is now
   `StepFactoryContext` (a back-compat `ProductContext` alias remains until consumers migrate), distinct
   from the identity `delivery.context.ProductContext` (§4e).
