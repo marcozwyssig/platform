@@ -10,7 +10,7 @@
 #   1. ensures the target is a git repo (git init if it is a fresh directory);
 #   2. vendors the delivery platform as a git submodule at lib/platform (the conventional path);
 #   3. scaffolds the product skeleton via `python -m delivery.bootstrap <name>` (shim + <name>.yaml +
-#      orchestrator package, all correct out of the box: kernel deps via -r, a working `all` composite,
+#      orchestrator package, all correct out of the box: kernel deps via -r, a working `all` aggregate,
 #      marker-walk root detection);
 #   4. verifies the assembled CLI by actually running `./<name>.sh help`.
 #
