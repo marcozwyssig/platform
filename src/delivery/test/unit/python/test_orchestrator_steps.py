@@ -218,3 +218,78 @@ def test_without_stop_on_failure_a_failed_step_does_not_skip_the_rest():
     # Assert: the step after the failure still ran (no SKIPPED), overall still a failure
     assert p.steps[2].state == StepState.OK
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# A Pipeline is a GRAPH when its steps declare `needs`
+# ---------------------------------------------------------------------------
+
+def _named(label: str, needs=()) -> Step:
+    return Step(label=label, needs=needs, action=lambda: Outcome(rc=0, output=""))
+
+
+def test_a_pipeline_without_needs_keeps_its_declared_order_exactly():
+    """The property that makes the graph safe to add underneath pipelines nobody has migrated.
+
+    Opting in is writing `needs=`; until then nothing moves. A resolver that "improved" the order of an
+    un-annotated pipeline would reorder every existing build and bring-up on the way in.
+    """
+    labels = ["Build.test.java", "Build.image.builder", "Release.package.frr"]
+    pipeline = Pipeline("p", [_named(name) for name in labels])
+    assert [s.label for s in pipeline.steps] == labels
+
+
+def test_a_step_runs_after_what_it_needs_even_when_declared_before_it():
+    # arrange: the packaging step is declared FIRST but needs the compile
+    pipeline = Pipeline("p", [
+        _named("Release.package.netctl", needs=("Build.compile.netctl",)),
+        _named("Build.compile.netctl"),
+    ])
+    # act / assert
+    labels = [s.label for s in pipeline.steps]
+    assert labels.index("Build.compile.netctl") < labels.index("Release.package.netctl")
+
+
+def test_a_step_two_others_need_runs_exactly_once():
+    """The complaint this exists for: in a LIST, "already done" is a property a human maintains by
+    ordering it correctly, and it degrades silently - netctl's build compiled Java twice and nothing
+    said so. Here it is the resolver's job."""
+    pipeline = Pipeline("p", [
+        _named("Release.package.netctl", needs=("Build.compile.netctl",)),
+        _named("Build.aot.netctl", needs=("Build.compile.netctl",)),
+        _named("Build.compile.netctl"),
+    ])
+    labels = [s.label for s in pipeline.steps]
+    assert labels.count("Build.compile.netctl") == 1
+    assert labels.index("Build.compile.netctl") == 0
+
+
+def test_a_duplicate_label_is_refused_rather_than_deduped():
+    # arrange: two steps claiming one name make "already done" ambiguous - dedup would silently pick
+    # one of two DIFFERENT pieces of work
+    with pytest.raises(ValueError, match="duplicate step label"):
+        Pipeline("p", [_named("Build.compile.netctl"), _named("Build.compile.netctl")])
+
+
+def test_a_cycle_is_refused_and_the_error_names_the_chain():
+    with pytest.raises(ValueError, match="dependency cycle") as excinfo:
+        Pipeline("p", [
+            _named("a", needs=("b",)),
+            _named("b", needs=("c",)),
+            _named("c", needs=("a",)),
+        ])
+    assert "a -> b -> c -> a" in str(excinfo.value)
+
+
+def test_needing_a_step_that_is_not_in_the_pipeline_names_both_ends():
+    with pytest.raises(ValueError, match="not a step of this pipeline") as excinfo:
+        Pipeline("p", [_named("Release.package.netctl", needs=("Build.compile.netctl",))])
+    assert "Release.package.netctl" in str(excinfo.value)
+    assert "Build.compile.netctl" in str(excinfo.value)
+
+
+def test_needs_given_as_a_bare_string_is_refused():
+    # arrange: `needs="Build.compile.netctl"` is a sequence of CHARACTERS, so it would silently become a
+    # dependency on 26 one-letter steps that do not exist - and the error would name a letter
+    with pytest.raises(TypeError, match="not a string"):
+        Step(label="x", needs="Build.compile.netctl", action=lambda: Outcome(rc=0, output=""))

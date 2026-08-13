@@ -69,6 +69,9 @@ class Step:
     action: Callable[[], Outcome] | None = None
     stream: Callable[[Emit], Outcome] | None = None
     command: str = ""
+    # The labels this step must run AFTER. Empty is the default and means "wherever the author put me",
+    # so a pipeline that declares no dependency is an ordered list exactly as before.
+    needs: tuple[str, ...] = ()
     state: StepState = StepState.PENDING
     output: str = ""
     rc: int | None = None
@@ -76,6 +79,9 @@ class Step:
     def __post_init__(self) -> None:
         if (self.action is None) == (self.stream is None):
             raise ValueError("a Step needs exactly one of action / stream")
+        if isinstance(self.needs, str):   # a bare string is 'depends on every letter of that name'
+            raise TypeError(f"needs must be a sequence of labels, not a string: {self.needs!r}")
+        self.needs = tuple(self.needs)
 
     def run(self, emit: Emit = _noop) -> Outcome:
         self.state = StepState.RUNNING
@@ -88,12 +94,82 @@ class Step:
 
 @dataclass
 class Pipeline:
+    """An ordered run of steps - and, when the steps declare `needs`, a DEPENDENCY GRAPH that decides
+    that order instead of the author keeping it true by hand.
+
+    Resolution happens ONCE, here, and rewrites `steps` into the order the graph implies. Every consumer
+    (both runners, the TUI's row indices, every test that reads `pipeline.steps`) therefore sees one
+    already-correct list and none of them needs to know a graph exists.
+
+    A pipeline whose steps declare no `needs` resolves to its declared order, element for element. That
+    is the property that makes this safe to add underneath pipelines nobody has migrated: opting in is
+    writing `needs=`, and until then nothing moves.
+
+    WHAT THE GRAPH BUYS, in the words of the complaint that prompted it: a task reached twice runs once.
+    In a list that is a property a human maintains by ordering it correctly, and it degrades silently -
+    the build compiled Java twice and nothing said so, because a list cannot express "already done".
+    Here it is the resolver's job: `needs` names a step, the step is emitted before its dependants, and
+    a second dependant naming it changes nothing.
+
+    Two authoring mistakes are refused rather than absorbed, because both mean the author believes
+    something the pipeline does not do:
+
+      - a DUPLICATE label. Two steps claiming one name make "already done" ambiguous, and dedup would
+        silently pick one of two different pieces of work.
+      - a CYCLE, or a `needs` naming a step that is not in the pipeline. The error names the chain.
+    """
+
     name: str
     steps: list[Step] = field(default_factory=list)
     # When true, a failed step skips the rest (they go SKIPPED) instead of running doomed work - the build
     # pipeline sets this so a red unit gate or web jar does not burn minutes building images that cannot
     # succeed. Default false keeps the bring-up pipeline's run-everything behaviour.
     stop_on_failure: bool = False
+
+    def __post_init__(self) -> None:
+        self.steps = resolve(self.steps)
+
+
+def resolve(steps: list[Step]) -> list[Step]:
+    """The steps in dependency order, each exactly once. PURE - it reorders, it runs nothing.
+
+    A STABLE topological sort: the declared order is walked in sequence and each step's `needs` are
+    emitted before it, so a graph-free pipeline comes out unchanged and a partially-annotated one keeps
+    its author's order everywhere the graph does not force otherwise. That matters more than an
+    optimal order - a pipeline whose steps move around between releases is one nobody can read a log of.
+    """
+    by_label: dict[str, Step] = {}
+    for step in steps:
+        if step.label in by_label:
+            raise ValueError(
+                f"duplicate step label {step.label!r}: two steps claiming one name make "
+                f"'already done' ambiguous, so the resolver cannot dedupe them")
+        by_label[step.label] = step
+
+    ordered: list[Step] = []
+    done: set[str] = set()
+    visiting: list[str] = []
+
+    def visit(label: str, wanted_by: str | None) -> None:
+        if label in done:
+            return
+        if label in visiting:
+            cycle = " -> ".join(visiting[visiting.index(label):] + [label])
+            raise ValueError(f"dependency cycle among the pipeline steps: {cycle}")
+        step = by_label.get(label)
+        if step is None:
+            raise ValueError(
+                f"step {wanted_by!r} needs {label!r}, which is not a step of this pipeline")
+        visiting.append(label)
+        for need in step.needs:
+            visit(need, label)
+        visiting.pop()
+        done.add(label)
+        ordered.append(step)
+
+    for step in steps:
+        visit(step.label, None)
+    return ordered
 
 
 def argv_step(label: str, argv: list[str], command: str | None = None) -> Step:
