@@ -12,10 +12,13 @@ import os
 import shlex
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from delivery import log
 from delivery.run import run_stream
+
+if TYPE_CHECKING:   # type-only: the step model is the LOWEST layer and must not import the manifest
+    from delivery.orchestrator.manifest import PlanNode
 
 # A sink for a step's live output lines (the TUI appends to a RichLog; headless prints them).
 Emit = Callable[[str], None]
@@ -94,6 +97,18 @@ class Pipeline:
     # pipeline sets this so a red unit gate or web jar does not burn minutes building images that cannot
     # succeed. Default false keeps the bring-up pipeline's run-everything behaviour.
     stop_on_failure: bool = False
+    # The plan as a TREE (#1275) plus the dotted path of the command that was INVOKED (`root_path` - named
+    # for the dotted path it holds, not a node). Both are display metadata: the runners execute `steps`
+    # exactly as before, and a pipeline built by hand (doctor) leaves them unset. APPENDED after
+    # stop_on_failure deliberately - a dozen tests construct Pipeline positionally, so a field inserted
+    # earlier would silently rebind their arguments rather than fail.
+    # CONTRACT: when `tree` is set, `steps[i]` is the step built for `tree.leaves()[i]` - `run_command`
+    # builds both from one comprehension over that same leaf order. Nothing enforces this at the type
+    # level, so a future change that inserts, drops or reorders a step without the matching tree change
+    # would silently mis-attribute a leaf's result; a reader that derives an aggregate's state from its
+    # children's steps (a future slice) depends on this holding.
+    tree: "PlanNode | None" = None
+    root_path: str = ""
 
 
 def argv_step(label: str, argv: list[str], command: str | None = None) -> Step:
