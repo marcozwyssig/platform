@@ -42,7 +42,7 @@ class StepState(str, Enum):
     RUNNING = "running"
     OK = "ok"
     FAILED = "failed"
-    SKIPPED = "skipped"   # not run: a previous step failed in a stop_on_failure pipeline (e.g. build)
+    SKIPPED = "skipped"   # not run: a failure aborted the subtree this step belongs to (see abort_after)
 
 
 # The ONE state vocabulary both runners render: the TUI's tree rows and the headless tree print use these
@@ -104,22 +104,54 @@ class Step:
 class Pipeline:
     name: str
     steps: list[Step] = field(default_factory=list)
-    # When true, a failed step skips the rest (they go SKIPPED) instead of running doomed work - the build
-    # pipeline sets this so a red unit gate or web jar does not burn minutes building images that cannot
-    # succeed. Default false keeps the bring-up pipeline's run-everything behaviour.
+    # The pipeline-wide stop flag, and the ONLY one for a pipeline with no usable `tree`: when true, a
+    # failed step skips ALL the rest (they go SKIPPED) instead of running doomed work. `doctor` and the
+    # other hand-built pipelines live here. With a usable tree the flag is per NODE and this field is not
+    # consulted - see `abort_after`, which `run_command` keeps consistent by setting this to the ROOT
+    # node's own flag, so degrading to the flat shape degrades to the root's decision rather than to some
+    # unrelated default.
     stop_on_failure: bool = False
     # The plan as a TREE (#1275) plus the dotted path of the command that was INVOKED (`root_path` - named
-    # for the dotted path it holds, not a node). Both are display metadata: the runners execute `steps`
-    # exactly as before, and a pipeline built by hand (doctor) leaves them unset. APPENDED after
+    # for the dotted path it holds, not a node). `root_path` is display metadata; `tree` is display metadata
+    # PLUS the one thing execution reads from it, each node's `stop_on_failure` (netctl#1317). The runners
+    # still walk the flat `steps` list in order; what the tree changes is which of the remaining steps a
+    # failure skips. A pipeline built by hand (doctor) leaves both unset. APPENDED after
     # stop_on_failure deliberately - a dozen tests construct Pipeline positionally, so a field inserted
     # earlier would silently rebind their arguments rather than fail.
     # CONTRACT: when `tree` is set, `steps[i]` is the step built for `tree.leaves()[i]` - `run_command`
     # builds both from one comprehension over that same leaf order. Nothing enforces this at the type
     # level, so a future change that inserts, drops or reorders a step without the matching tree change
-    # would silently mis-attribute a leaf's result; a reader that derives an aggregate's state from its
-    # children's steps (a future slice) depends on this holding.
+    # would silently mis-attribute a leaf's result AND mis-scope what a failure skips; `usable_tree` is
+    # where that contract is checked, once.
     tree: "PlanNode | None" = None
     root_path: str = ""
+    # The remembered verdict of that check: None = not yet asked. Not an init field - it is derived, and a
+    # caller must never be able to assert a pairing the kernel has not verified.
+    _verified: "bool | None" = field(default=None, init=False, repr=False, compare=False)
+
+    def usable_tree(self) -> "PlanNode | None":
+        """The plan tree when the kernel can VERIFY the leaf-to-step pairing, else None - the ONE verdict
+        `build_rows` (display) and `abort_after` (execution) both read.
+
+        Computed once and remembered, deliberately. Both consumers ask at different points of a run, over a
+        mutable `steps` list of mutable `Step`s, and "they happen to call the same helper" is a claim
+        nothing enforces: three independent evaluations could disagree, and a display that shows the plan
+        while execution scopes a failure by something else is the one outcome worse than either failing
+        alone. The verdict is a property of how the pipeline was BUILT, so asking once is also the honest
+        reading of it.
+
+        A rejected tree is WARNED about, once, naming what is lost: the display shape is the smaller half,
+        the stop SCOPE is the safety-relevant one. Dropping every subtree's `stop_on_failure` back onto a
+        root that says `false` reinstates exactly the defect netctl#1317 exists to fix, and it would do so
+        with no signal beyond a tree that came out flat."""
+        if self._verified is None:
+            self._verified = self.tree is not None and _pairs_with_leaves(self.tree.leaves(), self.steps)
+            if self.tree is not None and not self._verified:
+                stops = "the whole run stops" if self.stop_on_failure else "nothing is skipped"
+                log.warn(f"{self.name}: the plan tree does not pair with the steps that will run, so it is "
+                         f"not used - the display falls back to a flat list AND every subtree's "
+                         f"stop_on_failure is dropped, so a failure now means {stops}")
+        return self.tree if self._verified else None
 
 
 @dataclass(frozen=True, eq=False)
@@ -217,13 +249,109 @@ def _pairs_with_leaves(leaves: "tuple[PlanNode, ...]", steps: list[Step]) -> boo
     What the kernel owns is `Step.command`, the exact-command identity. A step built for a planned leaf
     carries that leaf's dotted path (netctl's factory spells it `manifest_command(name)`, which is
     `path_by_name` with the bare name as its fallback for a name the manifest cannot resolve
-    unambiguously), so the pairing is verifiable: BOTH spellings are accepted, and an empty `command` is
-    tolerated because a hand-built step legitimately has none. Only a step that names something else is
-    evidence of a real mis-pairing."""
+    unambiguously), so the pairing is verifiable and BOTH spellings are accepted.
+
+    A step that names NOTHING is not verifiable, and since netctl#1317 that is a rejection rather than a
+    tolerance. The tolerance was written when this verdict only chose a display shape, where trusting an
+    unnamed step costs a mislabelled row; it now also chooses what does NOT RUN, where the same trust
+    reversed the steps and skipped `build.image` for a failure inside `deploy.up`, a subtree it is not even
+    in. A hand-built step legitimately carries no command - and a hand-built pipeline has no tree, so it
+    never reaches this function. On the path that does reach it, an unverifiable pairing must degrade
+    (loudly, see `Pipeline.usable_tree`) rather than be trusted."""
     if len(leaves) != len(steps):
         return False
-    return all(not step.command or step.command in (leaf.path, leaf.name)
-               for leaf, step in zip(leaves, steps))
+    return all(step.command in (leaf.path, leaf.name) for leaf, step in zip(leaves, steps))
+
+
+# --- what a failure aborts (netctl#1317) --------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Abort:
+    """What ONE step failure aborts: the indices of the steps that must not run, and the dotted path of the
+    subtree whose flag decided it (empty when the decision came from the pipeline's own single flag, so a
+    reader can tell "the whole run stops" from "this subtree stops").
+
+    INVARIANT: a named scope skips at least one step. An `Abort` that names a subtree and skips nothing
+    would let `reason` announce that some node stopped a run in which nothing was stopped, and the shape is
+    reachable - a flagged aggregate whose LAST leaf is the one that fails has no remainder to abort. That
+    case is not a scope with an empty set, it is no abort at all, so it is constructed as one."""
+    scope: str
+    indices: frozenset[int]
+
+    def __post_init__(self) -> None:
+        if self.scope and not self.indices:
+            raise ValueError("an Abort that skips no step must not name a scope")
+
+    @property
+    def reason(self) -> str:
+        """The one line a runner shows beside a step it is not going to run."""
+        return f"{self.scope} stopped on a failure" if self.scope else "a previous step failed"
+
+
+_NOTHING_ABORTED = Abort(scope="", indices=frozenset())
+
+
+def _chain_to(node: "PlanNode", target: "PlanNode") -> tuple["PlanNode", ...]:
+    """The nodes from `node` down to `target` inclusive, or () when `target` is not in that subtree.
+
+    Matched by IDENTITY, not equality: PlanNode is a NamedTuple and therefore compares by value, so two
+    structurally identical leaves would be indistinguishable by `==`. The tree and the leaves come from one
+    traversal, so the objects are the same objects."""
+    if node is target:
+        return (node,)
+    for child in node.children:
+        found = _chain_to(child, target)
+        if found:
+            return (node,) + found
+    return ()
+
+
+def abort_after(pipeline: Pipeline, failed: int) -> Abort:
+    """Which of the remaining steps a failure at step `failed` skips - the ONE place both runners ask
+    (netctl#1317). `stop_on_failure` is declared per command, so it is a property of the SUBTREE that
+    declares it, not of the run.
+
+    With a usable tree the scope is the OUTERMOST ancestor of the failed leaf whose flag is TRUE, and the
+    skip set is that node's remaining leaves. The reason it is the outermost and not the nearest: the
+    nearest one aborts its own subtree, that abort is itself a failure its parent sees, and each further
+    ancestor then decides by its own flag whether to carry on with its siblings. A `false` ancestor
+    declines to stop for a failure; it does not absorb it. An explicit `false` is therefore
+    indistinguishable from an unset flag and cannot shield its subtree from an outer `true` - the manifest
+    has no way to say "stop here but no further", and this change does not add one.
+
+    The failed leaf itself is part of the chain, so a `true` on a LEAF would scope to a subtree of one and
+    abort nothing. `load()` rejects it there for exactly that reason, the same stance it takes on
+    `keep_awake` and `hidden`.
+
+    The behaviour restored here is the PRE-aggregate one: a failing `up` aborts its own phases and the
+    `test all` around it carries on to the next gate.
+
+    LIMITATION (netctl#1317, follow-up filed): `plan_tree_for` is a DFS SPANNING tree, so a dependency
+    reached along several paths is planned at its FIRST occurrence only. A flagged aggregate that declared
+    such a dependency but lost it to an earlier sibling is not on that leaf's chain, and therefore does not
+    stop for its own dependency's failure. Fixing it means changing what a plan tree is, not what this
+    function reads; today the wider `true` above such an aggregate is what catches the case.
+
+    WITHOUT a usable tree, the pipeline's single `stop_on_failure` decides for the whole run, exactly as
+    before: `doctor` and the other hand-built pipelines have no tree at all, and a tree whose leaf-to-step
+    pairing the kernel cannot verify must not be trusted with an execution decision either. The verdict
+    comes from `Pipeline.usable_tree`, the same one `build_rows` reads and the place that warns when it is
+    negative: a degraded display and a degraded stop-scope have one cause, and a display-level degrade must
+    never silently change EXECUTION semantics."""
+    steps = pipeline.steps
+    tree = pipeline.usable_tree()
+    if tree is None:
+        return (Abort(scope="", indices=frozenset(range(failed + 1, len(steps))))
+                if pipeline.stop_on_failure else _NOTHING_ABORTED)
+    leaves = tree.leaves()
+    scope = next((node for node in _chain_to(tree, leaves[failed]) if node.spec.stop_on_failure), None)
+    if scope is None:
+        return _NOTHING_ABORTED
+    within = {id(leaf) for leaf in scope.leaves()}
+    indices = frozenset(index for index in range(failed + 1, len(leaves)) if id(leaves[index]) in within)
+    # A flagged node whose LAST leaf failed has no remainder: nothing is aborted, so nothing names a scope.
+    return Abort(scope=scope.path or scope.name, indices=indices) if indices else _NOTHING_ABORTED
 
 
 def build_rows(pipeline: Pipeline) -> Row:
@@ -231,31 +359,30 @@ def build_rows(pipeline: Pipeline) -> Row:
     invoked command, and the children are either planned commands (dotted paths) or, for a pipeline built
     by hand, that command's internal probes (prose labels).
 
-    With `pipeline.tree` set, the structure is the plan's own and each planned leaf carries the Step built
-    for it, relying on the contract `Pipeline.tree` states: `steps[i]` is the step for `tree.leaves()[i]`.
-    Nothing types that contract, so `_pairs_with_leaves` checks as much of it as the kernel can see before
-    it is used, and the renderer drops to the flat shape when the check fails. A display defect must not
-    silently relabel results, and it must not abort a running pipeline either.
+    With a usable `pipeline.tree`, the structure is the plan's own and each planned leaf carries the Step
+    built for it, relying on the contract `Pipeline.tree` states: `steps[i]` is the step for
+    `tree.leaves()[i]`. Nothing types that contract, so `Pipeline.usable_tree` checks as much of it as the
+    kernel can see - once, for this renderer and for `abort_after` alike - and the renderer drops to the
+    flat shape when the check fails. A display defect must not silently relabel results, and it must not
+    abort a running pipeline either.
 
     Without a usable tree (`doctor`, `up` - both built by hand), the root is `pipeline.root_path` and the
     steps hang off it flat. The bare `pipeline.name` is only the last resort for a pipeline that set no
     path at all: falling back to it whenever a tree is missing would reintroduce the second vocabulary this
     change exists to remove."""
-    tree = pipeline.tree
+    tree = pipeline.usable_tree()
     if tree is not None:
-        leaves = tree.leaves()
-        if _pairs_with_leaves(leaves, pipeline.steps):
-            step_of = {id(leaf): step for leaf, step in zip(leaves, pipeline.steps)}
-            paths = _paths_by_name(tree, {})
+        step_of = {id(leaf): step for leaf, step in zip(tree.leaves(), pipeline.steps)}
+        paths = _paths_by_name(tree, {})
 
-            def visit(node: "PlanNode") -> Row:
-                children = tuple(visit(child) for child in node.children)
-                planned = {child.name for child in node.children}
-                omitted = tuple(paths.get(dep, dep) for dep in node.spec.depends_on if dep not in planned)
-                return Row(label=node.path or node.name, children=children,
-                           step=step_of.get(id(node)), omitted=omitted)
+        def visit(node: "PlanNode") -> Row:
+            children = tuple(visit(child) for child in node.children)
+            planned = {child.name for child in node.children}
+            omitted = tuple(paths.get(dep, dep) for dep in node.spec.depends_on if dep not in planned)
+            return Row(label=node.path or node.name, children=children,
+                       step=step_of.get(id(node)), omitted=omitted)
 
-            return visit(tree)
+        return visit(tree)
     return Row(label=pipeline.root_path or pipeline.name,
                children=tuple(Row(label=step.label or step.command, step=step) for step in pipeline.steps))
 
@@ -333,13 +460,17 @@ def run_headless(pipeline: Pipeline, verbose: bool | None = None) -> int:
     show_passing = _verbose_env() if verbose is None else verbose
     failures = 0
     skipped = 0
-    stopped = False
-    for step in pipeline.steps:
+    # Step index -> why it will not run. A set of doomed indices rather than a `stopped` latch, because a
+    # failure now aborts a SUBTREE and not necessarily the tail of the run (netctl#1317): the steps after an
+    # aborted subtree may well be its siblings, which still run. The first abort that claims an index owns
+    # the reason printed for it.
+    aborted: dict[int, str] = {}
+    for index, step in enumerate(pipeline.steps):
         title = step.command or step.label      # exact-command identity when the step carries one (#897)
-        if stopped:
+        if index in aborted:
             step.state = StepState.SKIPPED
             skipped += 1
-            log.warn(f"{title} - skipped (a previous step failed)")
+            log.warn(f"{title} - skipped ({aborted[index]})")
             continue
         log.info(title)
         outcome = step.run(lambda line: print(f"  {line}", flush=True))
@@ -350,8 +481,9 @@ def run_headless(pipeline: Pipeline, verbose: bool | None = None) -> int:
         else:
             failures += 1
             log.warn(f"{title} - failed (rc {outcome.rc})")
-            if pipeline.stop_on_failure:
-                stopped = True
+            abort = abort_after(pipeline, index)
+            for doomed in abort.indices:
+                aborted.setdefault(doomed, abort.reason)
     # A header, because the two blocks can legitimately name the same step differently: the per-step line
     # above uses `command or label` (the exact-command identity, netctl#897) and a tree row uses the row's
     # display identity, which for a hand-built pipeline is the prose label. Without a line saying so, a CI

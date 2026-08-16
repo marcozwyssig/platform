@@ -8,12 +8,15 @@ import shlex
 
 import pytest
 
+from delivery.orchestrator.manifest import load as manifest_load
 from delivery.orchestrator.steps import (
     VERBOSE_ENV,
+    Abort,
     Outcome,
     Pipeline,
     Step,
     StepState,
+    abort_after,
     argv_step,
     overall_rc,
     run_headless,
@@ -22,6 +25,12 @@ from delivery.orchestrator.steps import (
 
 def _step(label: str, rc: int, output: str = "") -> Step:
     return Step(label=label, action=lambda: Outcome(rc=rc, output=output))
+
+
+def _command_step(command: str, rc: int = 0) -> Step:
+    """A step carrying its exact-command identity, the way a product's step factory builds one - which is
+    what lets the kernel verify a leaf-to-step pairing at all."""
+    return Step(label=command, action=lambda: Outcome(rc=rc, output=""), command=command)
 
 
 def test_step_run_transitions_to_ok_and_records_output():
@@ -196,7 +205,7 @@ def test_argv_step_takes_an_explicit_command_override():
     assert s.command == "build.package"
 
 
-def test_stop_on_failure_skips_the_steps_after_a_failure():
+def test_stop_on_failure_skips_the_steps_after_a_failure_when_there_is_no_tree():
     # Arrange: a stop_on_failure pipeline whose middle step fails (e.g. the build's web jar)
     p = Pipeline("build", [_step("unit gate", 0), _step("web jar", 1), _step("web image", 0)],
                  stop_on_failure=True)
@@ -249,6 +258,462 @@ def test_pipeline_carries_the_plan_tree_and_the_invoked_commands_dotted_path():
     node = PlanNode(name="seed", path="deploy.seed", spec=CommandSpec(impl="demo.impls:seed", help="Seed."))
     # Act
     p = Pipeline("seed", [_step("seed", 0)], False, node, "deploy.seed")
-    # Assert: the runners ignore both; they exist so a renderer can show the structure and the identity
+    # Assert: both ride along on the pipeline - the path purely so a renderer can show the invoked identity,
+    # the tree additionally so a failure can be scoped to the subtree that declared stop_on_failure (#1317)
     assert p.tree is node
     assert p.root_path == "deploy.seed"
+
+
+# --- stop_on_failure is a property of the SUBTREE (netctl#1317) ---------------------------------------
+#
+# `stop_on_failure` is declared per aggregate, so a failure must abort the subtree that declared it and
+# leave that subtree's siblings alone. The oracle is the behaviour that existed before an aggregate's
+# members became the parent's steps: a failing `up` aborted its own phases and the `test all` around it
+# carried on to the next gate.
+#
+#     test.all              <- ROOT_FLAG
+#       build.build         <- BUILD_FLAG
+#         build.unit
+#         build.image
+#       deploy.up           <- UP_FLAG
+#         deploy.up-preflight
+#         deploy.up-deploy
+#       test.accept
+#
+# Leaf (= step) order is therefore: unit, image, up-preflight, up-deploy, accept.
+
+_GATES_MANIFEST = """
+groups:
+  build:
+    unit:  { impl: "demo.impls:unit",  help: "The unit gate." }
+    image: { impl: "demo.impls:image", help: "Build the image." }
+    build: { help: "The full build.", depends_on: [unit, image], stop_on_failure: BUILD_FLAG }
+  deploy:
+    up-preflight: { impl: "demo.impls:preflight", help: "The image provenance guard." }
+    up-deploy:    { impl: "demo.impls:deploy",    help: "Deploy the lab." }
+    up:           { help: "Bring the lab up.", depends_on: [up-preflight, up-deploy],
+                    stop_on_failure: UP_FLAG }
+  test:
+    accept: { impl: "demo.impls:accept", help: "The acceptance gate." }
+    all:    { help: "Every gate.", depends_on: [build, up, accept], stop_on_failure: ROOT_FLAG }
+env_groups: [deploy]
+"""
+
+# Three levels, so "the NEAREST flagged ancestor" and "the OUTERMOST flagged ancestor" are distinguishable:
+#
+#     run.root            <- ROOT_FLAG
+#       gate.mid          <- MID_FLAG
+#         gate.inner      <- INNER_FLAG
+#           gate.a1
+#           gate.a2
+#         gate.b1
+#       run.tail
+#
+# Leaf order: a1, a2, b1, tail.
+
+_NESTED_GATES_MANIFEST = """
+groups:
+  gate:
+    a1:    { impl: "demo.impls:a1", help: "Inner step one." }
+    a2:    { impl: "demo.impls:a2", help: "Inner step two." }
+    b1:    { impl: "demo.impls:b1", help: "The inner aggregate's sibling." }
+    inner: { help: "The inner aggregate.", depends_on: [a1, a2], stop_on_failure: INNER_FLAG }
+    mid:   { help: "The middle aggregate.", depends_on: [inner, b1], stop_on_failure: MID_FLAG }
+  run:
+    tail: { impl: "demo.impls:tail", help: "The step after everything." }
+    root: { help: "The whole run.", depends_on: [mid, tail], stop_on_failure: ROOT_FLAG }
+env_groups: [run]
+"""
+
+
+def _with_flags(text: str, **flags: bool) -> str:
+    """The manifest with each FLAG placeholder replaced by a YAML boolean, so one readable manifest covers
+    every flag combination without a wall of near-identical YAML."""
+    for name, value in flags.items():
+        text = text.replace(f"{name.upper()}_FLAG", str(value).lower())
+    return text
+
+
+def _planned(text: str, root: str) -> Pipeline:
+    """A Pipeline built exactly as `run_command` builds one: one step per plan leaf, in leaf order, each
+    carrying its dotted identity (so the leaf-to-step guard sees a well-paired tree), and the pipeline's own
+    flag taken from the ROOT node - the fallback run_command sets for the degraded shape."""
+    tree = manifest_load(text).plan_tree_for(root)
+    steps = [Step(label=leaf.name, command=leaf.path, action=lambda: Outcome(rc=0, output=""))
+             for leaf in tree.leaves()]
+    return Pipeline(root, steps, tree.spec.stop_on_failure, tree, tree.path)
+
+
+def _fail(pipeline: Pipeline, *names: str) -> Pipeline:
+    """Make the named steps fail. Returns the pipeline so a test can arrange in one expression."""
+    for step in pipeline.steps:
+        if step.label in names:
+            step.action = lambda: Outcome(rc=1, output="")
+    return pipeline
+
+
+def _states(pipeline: Pipeline) -> dict[str, StepState]:
+    return {step.label: step.state for step in pipeline.steps}
+
+
+def test_a_failure_aborts_the_flagged_subtree_and_lets_the_false_root_carry_on():
+    """The defect this change exists for: `test all` is false because a suite must run every gate, but the
+    `up` it plans is true because deploying on a dead preflight guard is forty doomed minutes."""
+    # Arrange: the provenance guard dies inside the `true` up subtree, under a `false` root
+    pipeline = _fail(_planned(_with_flags(_GATES_MANIFEST, root=False, build=False, up=True), "all"),
+                     "up-preflight")
+    # Act
+    rc = run_headless(pipeline, verbose=False)
+    # Assert: up's remaining phase is skipped, and the gates AROUND up still run
+    assert _states(pipeline) == {
+        "unit": StepState.OK,
+        "image": StepState.OK,
+        "up-preflight": StepState.FAILED,
+        "up-deploy": StepState.SKIPPED,
+        "accept": StepState.OK,
+    }
+    assert rc == 1
+
+
+def test_a_true_root_aborts_the_whole_run_even_when_the_failure_is_in_a_false_subtree():
+    """The reverse of the case above, and the reason an ancestor's `false` must not ABSORB a failure: it
+    only declines to stop for it. A `bringup` that declared stop_on_failure would otherwise keep deploying
+    after its own build died just because the build aggregate declared nothing."""
+    # Arrange
+    pipeline = _fail(_planned(_with_flags(_GATES_MANIFEST, root=True, build=False, up=False), "all"),
+                     "up-preflight")
+    # Act
+    rc = run_headless(pipeline, verbose=False)
+    # Assert: everything after the failure is skipped, up's own sibling gate included
+    assert _states(pipeline) == {
+        "unit": StepState.OK,
+        "image": StepState.OK,
+        "up-preflight": StepState.FAILED,
+        "up-deploy": StepState.SKIPPED,
+        "accept": StepState.SKIPPED,
+    }
+    assert rc == 1
+
+
+def test_the_siblings_of_an_aborted_subtree_still_run():
+    # Arrange: the unit gate dies inside a `true` build subtree; up and accept are build's siblings
+    pipeline = _fail(_planned(_with_flags(_GATES_MANIFEST, root=False, build=True, up=True), "all"),
+                     "unit")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: only build's own remainder is skipped
+    assert _states(pipeline) == {
+        "unit": StepState.FAILED,
+        "image": StepState.SKIPPED,
+        "up-preflight": StepState.OK,
+        "up-deploy": StepState.OK,
+        "accept": StepState.OK,
+    }
+
+
+def test_a_failure_with_no_ancestor_setting_the_flag_runs_every_remaining_step():
+    """The negative case: nothing in the chain asks to stop, so nothing is skipped and the run still fails."""
+    # Arrange
+    pipeline = _fail(_planned(_with_flags(_GATES_MANIFEST, root=False, build=False, up=False), "all"),
+                     "unit")
+    # Act
+    rc = run_headless(pipeline, verbose=False)
+    # Assert
+    assert all(state != StepState.SKIPPED for state in _states(pipeline).values())
+    assert _states(pipeline)["unit"] == StepState.FAILED
+    assert rc == 1
+
+
+def test_each_flagged_subtree_aborts_only_its_own_remainder_when_two_of_them_fail():
+    """Two independent failures in one run: each stops its own subtree, and the gate after both still runs.
+    A single `stopped` latch cannot express this at all."""
+    # Arrange
+    pipeline = _fail(_planned(_with_flags(_GATES_MANIFEST, root=False, build=True, up=True), "all"),
+                     "unit", "up-preflight")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert
+    assert _states(pipeline) == {
+        "unit": StepState.FAILED,
+        "image": StepState.SKIPPED,
+        "up-preflight": StepState.FAILED,
+        "up-deploy": StepState.SKIPPED,
+        "accept": StepState.OK,
+    }
+
+
+def test_the_walk_continues_past_the_nearest_flagged_ancestor_to_the_outermost_one():
+    """The nearest ancestor aborts its subtree, and that abort is itself a failure its own parent sees. With
+    both flags set the outer one therefore wins, which is the difference between "stop the phase" and "stop
+    the run" being expressible in one manifest."""
+    # Arrange: the inner aggregate AND the root both stop on failure
+    pipeline = _fail(_planned(_with_flags(_GATES_MANIFEST, root=True, build=False, up=True), "all"),
+                     "up-preflight")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: not just up-deploy - accept, which sits outside up entirely, is skipped too
+    assert _states(pipeline)["up-deploy"] == StepState.SKIPPED
+    assert _states(pipeline)["accept"] == StepState.SKIPPED
+
+
+def test_a_leafs_own_stop_on_failure_is_rejected_at_load_rather_than_silently_scoping_to_nothing():
+    """A leaf's subtree is the leaf, so the flag there could only ever skip nothing. That used to load
+    cleanly and do nothing, which is the trap `keep_awake` and `hidden` are already rejected for; the walk
+    would still be correct, so this pins the LOUD half. The message itself is pinned in test_manifest.py."""
+    # Arrange: the flag on the LEAF, on no aggregate above it
+    text = _with_flags(_GATES_MANIFEST, root=False, build=False, up=False).replace(
+        'unit:  { impl: "demo.impls:unit",  help: "The unit gate." }',
+        'unit:  { impl: "demo.impls:unit",  help: "The unit gate.", stop_on_failure: true }')
+    # Act / Assert
+    with pytest.raises(ValueError, match="stop_on_failure applies to an aggregate"):
+        manifest_load(text)
+
+
+def test_the_nearest_flagged_ancestor_leaves_its_own_sibling_running():
+    # Arrange: three levels, the flag on the INNERMOST aggregate only
+    pipeline = _fail(
+        _planned(_with_flags(_NESTED_GATES_MANIFEST, root=False, mid=False, inner=True), "root"), "a1")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: only inner's own remainder goes; b1 (inner's sibling) and tail both run
+    assert _states(pipeline) == {
+        "a1": StepState.FAILED,
+        "a2": StepState.SKIPPED,
+        "b1": StepState.OK,
+        "tail": StepState.OK,
+    }
+
+
+def test_a_flagged_middle_aggregate_takes_its_whole_subtree_and_not_the_step_after_it():
+    # Arrange: the same three levels, the flag on the MIDDLE aggregate only
+    pipeline = _fail(
+        _planned(_with_flags(_NESTED_GATES_MANIFEST, root=False, mid=True, inner=False), "root"), "a1")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: mid's whole remainder (a2 AND b1) goes, tail runs
+    assert _states(pipeline) == {
+        "a1": StepState.FAILED,
+        "a2": StepState.SKIPPED,
+        "b1": StepState.SKIPPED,
+        "tail": StepState.OK,
+    }
+
+
+def test_abort_after_names_the_subtree_that_stopped_so_a_ci_log_says_which_one(capsys):
+    """The skip line is the only place a reader learns WHY a step did not run. "a previous step failed" was
+    true when a failure stopped the run; with a subtree scope it would hide which subtree decided."""
+    # Arrange
+    pipeline = _fail(_planned(_with_flags(_GATES_MANIFEST, root=False, build=False, up=True), "all"),
+                     "up-preflight")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert
+    printed = capsys.readouterr().out
+    assert "deploy.up stopped on a failure" in printed
+    assert "deploy.up-deploy - skipped" in printed
+
+
+def test_abort_after_reports_the_scope_and_the_doomed_step_indices():
+    """The runners' shared answer, asserted directly: both a TUI thread and the headless loop consume it,
+    so its shape is worth pinning independently of either runner."""
+    # Arrange: leaves are unit, image, up-preflight, up-deploy, accept
+    pipeline = _planned(_with_flags(_GATES_MANIFEST, root=False, build=False, up=True), "all")
+    # Act
+    abort = abort_after(pipeline, 2)          # up-preflight failed
+    # Assert
+    assert abort.scope == "deploy.up"
+    assert abort.indices == frozenset({3})
+    assert abort.reason == "deploy.up stopped on a failure"
+
+
+def test_abort_after_reports_nothing_when_no_ancestor_of_the_failed_leaf_stops():
+    # Arrange
+    pipeline = _planned(_with_flags(_GATES_MANIFEST, root=False, build=True, up=False), "all")
+    # Act: up-preflight failed, and only the BUILD subtree stops - which the failure is not in
+    abort = abort_after(pipeline, 2)
+    # Assert
+    assert abort.indices == frozenset()
+    assert abort.scope == ""
+    assert abort.reason == "a previous step failed"
+
+
+def test_a_tree_less_pipeline_keeps_the_single_flag_behaviour():
+    """`doctor` and the other hand-built pipelines have no plan behind them, so the pipeline-wide flag is
+    the only expression of intent there and must keep meaning exactly what it meant."""
+    # Arrange
+    stopping = Pipeline("doctor", [_step("a", 0), _step("b", 1), _step("c", 0), _step("d", 0)],
+                        stop_on_failure=True)
+    running = Pipeline("doctor", [_step("a", 0), _step("b", 1), _step("c", 0), _step("d", 0)],
+                       stop_on_failure=False)
+    # Act
+    run_headless(stopping, verbose=False)
+    run_headless(running, verbose=False)
+    # Assert: true skips the WHOLE tail, false runs it
+    assert [s.state for s in stopping.steps[2:]] == [StepState.SKIPPED, StepState.SKIPPED]
+    assert [s.state for s in running.steps[2:]] == [StepState.OK, StepState.OK]
+
+
+def test_a_tree_the_pairing_guard_rejects_falls_back_to_the_pipelines_own_flag():
+    """A display-level degrade must not silently change EXECUTION semantics in either direction. The guard
+    that drops the tree for `build_rows` drops it here too, so the run falls back to the same single flag a
+    tree-less pipeline uses - never to subtree flags read off a tree that cannot be trusted to pair with
+    the steps that actually run."""
+    # Arrange: a plan whose subtrees BOTH stop on failure, against a step list the guard rejects (three
+    # steps for five leaves), and a pipeline flag of false
+    tree = manifest_load(_with_flags(_GATES_MANIFEST, root=False, build=True, up=True)).plan_tree_for("all")
+    pipeline = Pipeline("all", [_step("unit", 1), _step("image", 0), _step("accept", 0)], False,
+                        tree, tree.path)
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: the subtree flags are NOT consulted, so nothing is skipped
+    assert [s.state for s in pipeline.steps] == [StepState.FAILED, StepState.OK, StepState.OK]
+
+
+def test_a_rejected_tree_still_stops_the_run_when_the_pipeline_flag_says_so():
+    """The other half of the fallback: degrading must not lose a stop that the single flag does ask for."""
+    # Arrange: the same rejected pairing, this time with the pipeline flag set
+    tree = manifest_load(_with_flags(_GATES_MANIFEST, root=True, build=False, up=False)).plan_tree_for("all")
+    pipeline = Pipeline("all", [_step("unit", 1), _step("image", 0), _step("accept", 0)], True,
+                        tree, tree.path)
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert
+    assert [s.state for s in pipeline.steps] == [StepState.FAILED, StepState.SKIPPED, StepState.SKIPPED]
+
+
+def test_a_doomed_steps_action_is_never_invoked_and_not_merely_marked_skipped():
+    """SKIPPED is the state; not running is the POINT. Asserting the state alone would still pass over a
+    runner that ran the doomed work and relabelled it afterwards, which is the entire cost this flag
+    exists to avoid - forty minutes of deploying a stale image, marked skipped."""
+    # Arrange: record every action that is actually entered
+    ran: list[str] = []
+    tree = manifest_load(_with_flags(_GATES_MANIFEST, root=False, build=True, up=False)).plan_tree_for("all")
+    steps = [Step(label=leaf.name, command=leaf.path,
+                  action=lambda name=leaf.name: (ran.append(name),
+                                                 Outcome(rc=1 if name == "unit" else 0, output=""))[1])
+             for leaf in tree.leaves()]
+    pipeline = Pipeline("all", steps, tree.spec.stop_on_failure, tree, tree.path)
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: `image` was never entered, and carries none of the traces a run leaves behind
+    assert ran == ["unit", "up-preflight", "up-deploy", "accept"]
+    assert pipeline.steps[1].label == "image"
+    assert pipeline.steps[1].state == StepState.SKIPPED
+    assert pipeline.steps[1].rc is None and pipeline.steps[1].output == ""
+
+
+def test_a_tree_whose_steps_name_nothing_falls_back_to_the_pipelines_own_flag():
+    """The count and the order are right, but no step carries its identity, so the kernel cannot VERIFY the
+    pairing. It must not scope a failure by a tree it cannot check: the probe that reversed such steps
+    skipped `build.image` for a failure inside `deploy.up`, a subtree it is not even in."""
+    # Arrange: the up subtree says stop, the pipeline's own flag says do not
+    tree = manifest_load(_with_flags(_GATES_MANIFEST, root=False, build=False, up=True)).plan_tree_for("all")
+    pipeline = Pipeline("all", [_step(leaf.name, rc=1 if leaf.name == "up-preflight" else 0)
+                                for leaf in tree.leaves()], False, tree, tree.path)
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: no subtree flag was read at all
+    assert _states(pipeline)["up-deploy"] == StepState.OK
+    assert all(state != StepState.SKIPPED for state in _states(pipeline).values())
+
+
+def test_the_degrade_to_the_flat_shape_says_out_loud_that_the_stop_scopes_went_with_it(capsys):
+    """The degrade used to be silent, and with a `false` root that silently reinstates the very defect this
+    change fixes: every subtree flag dropped, nothing skipped, and the only signal a flat-looking tree. The
+    warning names the safety half, not merely the display shape."""
+    # Arrange: a plan whose subtrees stop on failure, against a step list the guard rejects
+    tree = manifest_load(_with_flags(_GATES_MANIFEST, root=False, build=True, up=True)).plan_tree_for("all")
+    pipeline = Pipeline("all", [_command_step("build.unit", rc=1)], False, tree, tree.path)
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert
+    printed = capsys.readouterr().out
+    assert "does not pair with the steps that will run" in printed
+    assert "stop_on_failure is dropped" in printed
+    assert "nothing is skipped" in printed
+
+
+def test_a_usable_tree_degrades_nothing_and_therefore_warns_about_nothing(capsys):
+    """The negative case for the warning: a well-paired plan must not cry wolf on every single run."""
+    # Arrange
+    pipeline = _fail(_planned(_with_flags(_GATES_MANIFEST, root=False, build=True, up=True), "all"), "unit")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert
+    assert "does not pair" not in capsys.readouterr().out
+
+
+def test_the_pairing_verdict_is_computed_once_for_display_and_execution_alike(capsys):
+    """Three evaluations over a mutable step list is three chances to disagree, and a run whose printed
+    tree says one thing while its skipping does another is worse than either failing alone. One verdict,
+    remembered - which a single warning for a run that asks from both sides is the visible proof of."""
+    # Arrange: a rejected pairing, in a run that fails (execution asks) and then prints its tree (display)
+    tree = manifest_load(_with_flags(_GATES_MANIFEST, root=True, build=False, up=False)).plan_tree_for("all")
+    pipeline = Pipeline("all", [_command_step("build.unit", rc=1), _command_step("build.image")], True,
+                        tree, tree.path)
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: warned once, and the verdict is stable however often it is asked afterwards
+    assert capsys.readouterr().out.count("does not pair with the steps") == 1
+    assert pipeline.usable_tree() is None and pipeline.usable_tree() is None
+
+
+def test_an_abort_that_skips_nothing_cannot_name_a_subtree():
+    """`reason` would otherwise announce that some node stopped a run in which nothing was stopped."""
+    # Arrange / Act / Assert
+    with pytest.raises(ValueError, match="must not name a scope"):
+        Abort(scope="deploy.up", indices=frozenset())
+
+
+def test_a_failure_in_the_last_leaf_of_a_flagged_subtree_is_no_abort_at_all():
+    """The reachable shape behind that invariant: the flagged node has no remainder left to abort."""
+    # Arrange: build stops on failure, and its LAST leaf (image, index 1) is the one that fails
+    pipeline = _planned(_with_flags(_GATES_MANIFEST, root=False, build=True, up=False), "all")
+    # Act
+    abort = abort_after(pipeline, 1)
+    # Assert
+    assert abort.indices == frozenset()
+    assert abort.scope == ""
+
+
+# A dependency reached along several paths is planned at its FIRST occurrence, so `late` below declares
+# `aot` but does not carry it: `early` got there first.
+#
+#     run.root
+#       build.early          <- plans jar and aot
+#         build.jar
+#         build.aot
+#       build.late           <- stop_on_failure, declares aot, carries only image
+#         build.image
+_RELOCATED_DEP_MANIFEST = """
+groups:
+  build:
+    jar:   { impl: "demo.impls:jar",   help: "Build the jar." }
+    aot:   { impl: "demo.impls:aot",   help: "The shared dependency." }
+    image: { impl: "demo.impls:image", help: "Build the image." }
+    early: { help: "Planned first.", depends_on: [jar, aot] }
+    late:  { help: "Declares aot too.", depends_on: [aot, image], stop_on_failure: true }
+  run:
+    root: { help: "The whole run.", depends_on: [early, late] }
+env_groups: [run]
+"""
+
+
+def test_a_dependency_dedup_moved_out_of_a_flagged_subtree_does_not_stop_it_documents_a_limitation():
+    """DOCUMENTS A KNOWN LIMITATION, it does not endorse it (follow-up filed off netctl#1317).
+
+    `plan_tree_for` is a DFS SPANNING tree, so `aot` is planned under `early`, which reached it first, and
+    `late` carries no node for it. `abort_after` walks the tree, so `late` is not on the failed leaf's chain
+    and does not stop for the failure of a dependency it declared. netctl has three such relocations today,
+    harmless only because a wider `true` sits above them. Fixing it means changing what a plan tree IS,
+    which is not this change; pinning the current behaviour means the follow-up will notice when it moves."""
+    # Arrange: aot fails, and the aggregate that declared it - but did not get to carry it - stops on failure
+    pipeline = _fail(_planned(_RELOCATED_DEP_MANIFEST, "root"), "aot")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: `image`, which IS in late's subtree, still runs
+    assert _states(pipeline) == {
+        "jar": StepState.OK,
+        "aot": StepState.FAILED,
+        "image": StepState.OK,
+    }
