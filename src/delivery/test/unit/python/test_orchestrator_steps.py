@@ -677,10 +677,12 @@ def test_a_failure_in_the_last_leaf_of_a_flagged_subtree_is_no_abort_at_all():
 
 
 # A dependency reached along several paths is planned at its FIRST occurrence, so `late` below declares
-# `aot` but does not carry it: `early` got there first.
+# `aot` but does not carry it: `early` got there first. EARLY_FLAG is the placeholder `_with_flags` fills:
+# false makes the two declarers of `aot` disagree, which loader rule 6 rejects (netctl#1319); true makes
+# them agree, which loads and leaves the relocation in place.
 #
 #     run.root
-#       build.early          <- plans jar and aot
+#       build.early          <- EARLY_FLAG, plans jar and aot
 #         build.jar
 #         build.aot
 #       build.late           <- stop_on_failure, declares aot, carries only image
@@ -691,7 +693,7 @@ groups:
     jar:   { impl: "demo.impls:jar",   help: "Build the jar." }
     aot:   { impl: "demo.impls:aot",   help: "The shared dependency." }
     image: { impl: "demo.impls:image", help: "Build the image." }
-    early: { help: "Planned first.", depends_on: [jar, aot] }
+    early: { help: "Planned first.", depends_on: [jar, aot], stop_on_failure: EARLY_FLAG }
     late:  { help: "Declares aot too.", depends_on: [aot, image], stop_on_failure: true }
   run:
     root: { help: "The whole run.", depends_on: [early, late] }
@@ -699,16 +701,29 @@ env_groups: [run]
 """
 
 
-def test_a_dependency_dedup_moved_out_of_a_flagged_subtree_does_not_stop_it_documents_a_limitation():
-    """DOCUMENTS A KNOWN LIMITATION, it does not endorse it (follow-up filed off netctl#1317).
+def test_a_relocated_dependency_whose_declarers_disagree_never_reaches_the_runner():
+    """The limitation `abort_after` names, closed at the manifest boundary (netctl#1319).
 
     `plan_tree_for` is a DFS SPANNING tree, so `aot` is planned under `early`, which reached it first, and
     `late` carries no node for it. `abort_after` walks the tree, so `late` is not on the failed leaf's chain
-    and does not stop for the failure of a dependency it declared. netctl has three such relocations today,
-    harmless only because a wider `true` sits above them. Fixing it means changing what a plan tree IS,
-    which is not this change; pinning the current behaviour means the follow-up will notice when it moves."""
-    # Arrange: aot fails, and the aggregate that declared it - but did not get to carry it - stops on failure
-    pipeline = _fail(_planned(_RELOCATED_DEP_MANIFEST, "root"), "aot")
+    and would not stop for the failure of a dependency it declared. Rather than change what a plan tree IS,
+    loader rule 6 rejects the shape: `early` and `late` sit in ONE plan (`run.root`) and disagree over
+    `aot`."""
+    # Arrange / Act / Assert: the pipeline cannot even be built, because the manifest does not load
+    with pytest.raises(ValueError, match="both declare dependency 'aot' but disagree on stop_on_failure"):
+        _planned(_with_flags(_RELOCATED_DEP_MANIFEST, early=False), "root")
+
+
+def test_a_relocated_dependency_between_agreeing_declarers_keeps_the_scope_of_whoever_carries_it():
+    """The case netctl#1319 deliberately leaves open, pinned so the full cure notices when it moves.
+
+    With both declarers flagged the manifest loads, and `aot` is still planned under `early` alone. The
+    failure is therefore caught by `early`, whose remainder is empty, so `late`'s own subtree runs even
+    though `late` declared the leaf that died. No declarer's POLICY is contradicted here - both asked to
+    stop - only the scope is narrower than `late` intended, which is why the guard rejects disagreement
+    and not relocation itself. Scoping the abort by the declaration graph is what would close it."""
+    # Arrange: aot fails, with both aggregates that declared it stopping on failure
+    pipeline = _fail(_planned(_with_flags(_RELOCATED_DEP_MANIFEST, early=True), "root"), "aot")
     # Act
     run_headless(pipeline, verbose=False)
     # Assert: `image`, which IS in late's subtree, still runs
@@ -716,4 +731,53 @@ def test_a_dependency_dedup_moved_out_of_a_flagged_subtree_does_not_stop_it_docu
         "jar": StepState.OK,
         "aot": StepState.FAILED,
         "image": StepState.OK,
+    }
+
+
+# The same hazard one level up, which rule 6 does NOT see: `first` and `mid` both declare `shared` and
+# both default to false, so the guard compares two falses and passes - while the flag that matters sits on
+# `guarded`, an ANCESTOR of `mid` rather than a declarer.
+#
+#     run.root
+#       gate.first           <- plans shared
+#         gate.shared
+#       gate.guarded         <- stop_on_failure, ancestor of a declarer of shared
+#         gate.mid           <- declares shared, carries only other
+#           gate.other
+#       gate.later
+_ANCESTOR_FLAG_MANIFEST = """
+groups:
+  gate:
+    shared:  { impl: "demo.impls:shared", help: "The shared dependency." }
+    other:   { impl: "demo.impls:other",  help: "What the guard protects." }
+    later:   { impl: "demo.impls:later",  help: "A step after the guard." }
+    first:   { help: "Planned first.", depends_on: [shared] }
+    mid:     { help: "Declares shared too.", depends_on: [shared, other] }
+    guarded: { help: "Wants to stop.", depends_on: [mid], stop_on_failure: true }
+  run:
+    root: { help: "The whole run.", depends_on: [first, guarded, later] }
+env_groups: [run]
+"""
+
+
+def test_a_flag_contradicted_through_an_ancestor_of_a_declarer_survives_the_guard_documents_a_limitation():
+    """DOCUMENTS A KNOWN LIMITATION, it does not endorse it (netctl#1319, option 2 is the cure).
+
+    Loader rule 6 compares each DIRECT declarer's own flag. Here both declarers of `shared` are unflagged,
+    so the manifest loads - and the aggregate that really asked to stop, `guarded`, is an ANCESTOR of one
+    of them. `shared` is planned under `first`, `guarded` is not on that leaf's chain, and its subtree runs
+    although the leaf its own subtree declared has died. That is netctl#1319's opening paragraph one level
+    up. Extending rule 6 to EFFECTIVE policy would make the comparison per plan and per declarer, which is
+    the declaration-graph scoping this ticket defers; pinning the behaviour means that change will notice
+    when it moves."""
+    # Arrange: the manifest loads (the guard stays silent), and shared - planned under `first` - fails
+    pipeline = _fail(_planned(_ANCESTOR_FLAG_MANIFEST, "root"), "shared")
+    # Act
+    run_headless(pipeline, verbose=False)
+    # Assert: nothing is aborted at all, so `other` runs inside the subtree `guarded` claimed to guard
+    assert abort_after(pipeline, 0) == Abort(scope="", indices=frozenset())
+    assert _states(pipeline) == {
+        "shared": StepState.FAILED,
+        "other": StepState.OK,
+        "later": StepState.OK,
     }

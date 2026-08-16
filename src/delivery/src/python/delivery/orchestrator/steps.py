@@ -327,11 +327,22 @@ def abort_after(pipeline: Pipeline, failed: int) -> Abort:
     The behaviour restored here is the PRE-aggregate one: a failing `up` aborts its own phases and the
     `test all` around it carries on to the next gate.
 
-    LIMITATION (netctl#1317, follow-up filed): `plan_tree_for` is a DFS SPANNING tree, so a dependency
-    reached along several paths is planned at its FIRST occurrence only. A flagged aggregate that declared
-    such a dependency but lost it to an earlier sibling is not on that leaf's chain, and therefore does not
-    stop for its own dependency's failure. Fixing it means changing what a plan tree is, not what this
-    function reads; today the wider `true` above such an aggregate is what catches the case.
+    LIMITATION (netctl#1317): `plan_tree_for` is a DFS SPANNING tree, so a dependency reached along several
+    paths is planned at its FIRST occurrence only. A flagged aggregate that declared such a dependency but
+    lost it to an earlier sibling is not on that leaf's chain, and therefore does not stop for its own
+    dependency's failure. Fixing that here would mean changing what a plan tree is, not what this function
+    reads, so the sharpest edge of it is GUARDED at load time instead (netctl#1319): `load()` rule 6
+    rejects a manifest in which two aggregates ONE plan reaches DIRECTLY declare the same dependency and
+    disagree on `stop_on_failure`. The limitation is narrowed by that, not removed - two shapes still reach
+    this function, and both are the declaration-graph scoping's job:
+      - declarers that AGREE. The dependency is still planned under one of them only, so the abort scope
+        comes out as that carrier's, which can be narrower than the loser asked for.
+      - a flagged ANCESTOR of a declarer. Rule 6 compares each declarer's OWN flag, never its effective
+        policy, so two unflagged declarers pass the guard while one of them sits under a `true` - and that
+        ancestor then does not stop for the failure of a dependency its own subtree declared. This is
+        netctl#1319's opening shape one level up, and it is documented, not endorsed.
+    The full cure - scoping the abort by the DECLARATION graph rather than by tree ancestry - stays open,
+    and closes both.
 
     WITHOUT a usable tree, the pipeline's single `stop_on_failure` decides for the whole run, exactly as
     before: `doctor` and the other hand-built pipelines have no tree at all, and a tree whose leaf-to-step
