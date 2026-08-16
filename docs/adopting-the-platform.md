@@ -141,7 +141,15 @@ environments:
 (`"module:function"`, a leaf) OR `depends_on` (a list of command names, an impl-less aggregate, #895) -
 never both. Optional: `passthrough_args: true` on a leaf (forward unrecognised trailing args to an
 underlying tool — netctl uses it on `accept` → pytest) and `stop_on_failure: true` on an aggregate (a
-failed plan step skips the rest).
+failed plan step skips the rest of THAT aggregate's subtree).
+
+`stop_on_failure` is scoped to the subtree that declares it, not to the run (netctl#1317). On a failure
+the runner walks up from the failed leaf to the nearest ancestor whose spec sets the flag, skips the
+remainder of that node's subtree, and lets each further ancestor decide by its own flag whether to carry
+on with its siblings. So a `test all` aggregate can stay `false` (every gate runs, the report is written)
+while the `up` it plans stays `true` (a dead preflight guard aborts the bring-up instead of deploying for
+forty minutes). A pipeline built by hand, with no plan tree behind it, keeps the single-flag behaviour:
+one failure skips everything after it.
 
 **`load()` validates loudly** (each violation is a `ValueError`):
 
@@ -304,8 +312,8 @@ Add your own aggregates by declaring impl-less `depends_on` commands in the mani
 Python per aggregate. Under the hood the synthesized callback calls
 `delivery.orchestrator.product.run_command`, which expands the name through `Manifest.plan_for`
 (transitive, deduped, each unique command once, in dependency order), maps each planned leaf through
-your factory into a `Step`, wraps them in a `Pipeline` carrying the aggregate's `stop_on_failure`, and
-dispatches through the shared TUI runner (headless fallback). `step_context` is only required when the
+your factory into a `Step`, wraps them in a `Pipeline` carrying the plan TREE (each node's own
+`stop_on_failure` included), and dispatches through the shared TUI runner (headless fallback). `step_context` is only required when the
 manifest declares aggregates; assembly fails loudly if one is declared without it.
 
 > The type was named `ProductContext` before netctl#737 and collided with
