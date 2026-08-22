@@ -50,7 +50,7 @@ up and the seams you then extend; §2 is that same scaffold step run by hand.
 | Manifest schema | `delivery.orchestrator.manifest` — Pydantic parse/validate, `load`, `resolve_impl` | Write `<product>.yaml` |
 | Command taxonomy / env-gate | `delivery.clitaxonomy.CommandTaxonomy` (pure) | (none — derived from your manifest) |
 | Env registry types | `delivery.environments` — `Environment`, `Registry`, `parse_data` | Supply valid backend names + the gate |
-| Product identity seam | `delivery.context.ProductContext` / `set_current` / `current` | Register one context in `paths.py` |
+| Product identity seam | `delivery.context.bootstrap` / `ProductContext` / `current` | One call in `paths.py` |
 | Aggregate runner | `delivery.orchestrator.product.run_command` + `steps` (`Step`/`Pipeline`/`dispatch`) + `tui` | Supply a command→`Step` factory via `assemble(step_context=…)` |
 | Compose deployments | `delivery.compose` — pure readings of `docker compose config --format json` (§4f) | Name the service, the health path, the mount, the uid, the variables |
 | Port preflight / readiness | `delivery.ports.free`, `delivery.waits.await_http` | Name the port and the URL |
@@ -91,8 +91,8 @@ orchestrator/src/python/orchestrator/
     __init__.py                                    # the product package
     __main__.py                                    # `python -m orchestrator` entry
     cli.py                                          # composition root: impls + assemble (step_context) + main
-    paths.py                                        # ProductContext wiring; root via a manifest-marker walk
-    environments.py                                # EnvironmentProvider (backends + env-gate)
+    paths.py                                        # one call: context.bootstrap(<product>, <this dir>)
+    environments.py                                # one call: environments.Provider(<var>, shim=, backends=)
 ```
 
 The package is **always** named `orchestrator` (mirroring netctl), so a hyphenated product slug never
@@ -206,40 +206,33 @@ impl-less aggregate command with `depends_on` instead.
 
 Your paths adapter DERIVES the repo root + manifest path and registers ONE context at import; kernel
 code reads it back via `delivery.context.current()`, so it never hardcodes your product name. The
-scaffolded `paths.py`:
+whole of the scaffolded `paths.py`:
 
 ```python
+from pathlib import Path
+
 from delivery import context
 
-# The manifest doubles as the repo-root MARKER: walk up from this file to the dir holding fooctl.yaml.
-_MANIFEST_NAME = "fooctl.yaml"
-
-def _find_root(start: Path, marker: str) -> Path:
-    for candidate in (start, *start.parents):
-        if (candidate / marker).is_file():
-            return candidate
-    raise RuntimeError(f"fooctl: cannot locate '{marker}' walking up from {start}")
-
-_DERIVED_ROOT = _find_root(Path(__file__).resolve().parent, _MANIFEST_NAME)
-_DERIVED_MANIFEST = _DERIVED_ROOT / _MANIFEST_NAME
-
-CONTEXT = context.set_current(
-    context.ProductContext.resolve("fooctl", _DERIVED_ROOT, _DERIVED_MANIFEST))
+CONTEXT = context.bootstrap("fooctl", Path(__file__).resolve().parent)
 ROOT = CONTEXT.root
 MANIFEST = CONTEXT.manifest_path
 ```
 
-`.resolve()` lets the kernel env vars `DELIVERY_PRODUCT_ROOT` / `DELIVERY_MANIFEST` override the
-derived defaults (a relocated checkout, a test fixture tree); with neither set the UX is byte-
-identical. Root detection is a **marker-walk**, not a fixed parent depth (netctl#737): it climbs to
-the directory that holds `<product>.yaml`, so relocating the `orchestrator` package deeper in the tree
-(as netctl did to `deploy/provision/orchestrator/`) needs no hand-edit. Keep the manifest at the repo
-root and the walk always finds it.
+`bootstrap` walks up from the file you hand it to the directory holding `fooctl.yaml` and registers
+the context. Root detection is a **marker-walk**, not a fixed parent depth (netctl#737), so relocating
+the `orchestrator` package deeper in the tree (as netctl and biz-cockpit both did, to
+`deploy/provision/orchestrator/`) needs no hand-edit — keep the manifest at the repo root and the walk
+always finds it. A checkout without the marker raises at IMPORT, which is where a broken checkout
+should surface rather than as a wrong path halfway through a deployment. The kernel env vars
+`DELIVERY_PRODUCT_ROOT` / `DELIVERY_MANIFEST` still override the derived defaults (a relocated
+checkout, a test fixture tree); with neither set the UX is byte-identical.
+
+A product whose manifest is not named after it passes the file name as a third argument.
 
 ### 4b. `EnvironmentProvider` — the environments seam (`environments.py`)
 
 `delivery.cli.main` needs a small **structural** Protocol from your product (nothing named is
-imported — the module just has to expose these members):
+imported — the object just has to expose these members):
 
 ```python
 class EnvironmentProvider(Protocol):
@@ -251,22 +244,33 @@ class EnvironmentProvider(Protocol):
     def require_backend(self, backend: str = ...) -> None: ...
 ```
 
-The scaffolded `environments.py` satisfies it by reading the manifest's `environments:`/`default:`
-sections straight from the context and delegating to `delivery.environments.parse_data` with YOUR
-valid backends:
+`delivery.environments.Provider` implements it. The whole of the scaffolded `environments.py`:
 
 ```python
-ENV_VAR = "FOOCTL_ENV"
-LOCAL = "local"
-_VALID_BACKENDS = (LOCAL,)          # widen this to add a cloud backend
+from delivery.environments import LOCAL, Provider
 
-def _registry() -> Registry:
-    data = context.current().manifest_data()
-    return _parse_data(data, _VALID_BACKENDS)   # validates backends + default, loudly
+ENV_VAR = "FOOCTL_ENV"
+
+PROVIDER = Provider(ENV_VAR, shim="./fooctl.sh", valid_backends=(LOCAL,))
 ```
 
-netctl's version adds `EXOSCALE` to `_VALID_BACKENDS` and dies clean in `require_backend` when a
-non-local env is targeted (the cloud path is unimplemented, #11).
+Three values, because three values are all that differ between products: the variable the active
+environment rides in, the backends this product IMPLEMENTS, and how its shim spells a command (so
+`PROVIDER.command_hint(env, cmd)` can hand an operator a line that actually dispatches). netctl adds
+`EXOSCALE` to `valid_backends` and gates the unimplemented cloud path with `require_backend()`.
+
+**One precedence, read by everything:**
+
+```
+explicit env token  >  exported ENV_VAR  >  the manifest's `default:`
+```
+
+This matters more than it looks. `delivery.cli.main` consumes a leading env token only when that
+token names no GROUP, so an environment whose name is also a group name — netctl and biz-cockpit both
+have some — can be reached ONLY through the variable. Earlier, hand-written copies of this module had
+`default()` read the manifest while `current()` read the variable, so with the variable set the CLI
+selected one environment and the commands acted on another. `Provider.current()` is defined as
+`default()` resolved against the matrix, which makes that divergence unrepresentable.
 
 ### 4c. `impl:` binding — command declaration → callable
 
@@ -472,7 +476,7 @@ four are now fixed in the scaffolder, so a freshly bootstrapped product is corre
   and injects it via `assemble(step_context=…)`, and `deploy.all` in the manifest is an impl-less
   `depends_on: [build, up]` aggregate, so `fooctl all` runs the `build → up` pipeline through the
   shared runner (§4e).
-- **Root detection is a marker-walk.** `paths.py` climbs to the directory holding `<product>.yaml`
+- **Root detection is a marker-walk.** `context.bootstrap` climbs to the directory holding `<product>.yaml`
   instead of a hardcoded `parents[N]`, so relocating the orchestrator dir needs no hand-edit (§4a).
   (The requirements `-r` `../` count stays layout-relative - a static pip file cannot self-locate.)
 - **The `ProductContext` name clash is gone.** The step-factory type is now
