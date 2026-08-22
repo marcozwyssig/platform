@@ -52,6 +52,10 @@ up and the seams you then extend; §2 is that same scaffold step run by hand.
 | Env registry types | `delivery.environments` — `Environment`, `Registry`, `parse_data` | Supply valid backend names + the gate |
 | Product identity seam | `delivery.context.ProductContext` / `set_current` / `current` | Register one context in `paths.py` |
 | Aggregate runner | `delivery.orchestrator.product.run_command` + `steps` (`Step`/`Pipeline`/`dispatch`) + `tui` | Supply a command→`Step` factory via `assemble(step_context=…)` |
+| Compose deployments | `delivery.compose` — pure readings of `docker compose config --format json` (§4f) | Name the service, the health path, the mount, the uid, the variables |
+| Port preflight / readiness | `delivery.ports.free`, `delivery.waits.await_http` | Name the port and the URL |
+| Image references | `delivery.images` — `hub_repo`, `image_ref`, `require_registry` | Supply name, tag, registry |
+| Running external tools | `delivery.run` — `run`, `stream`, `chain`, `run_stream` | Wrap the rc in `typer.Exit` |
 | Host-venv bootstrap | `src/delivery/src/sh/launch.sh` — ensurepip probe, venv, `pip install -r`, `exec python -m` | A ~5-line shim that sets 4 env vars |
 | Kernel dependencies | `src/delivery/requirements.txt` (owns typer/click/pyyaml/pydantic/rich/textual, #730) | `-r` it + add product-only deps |
 
@@ -344,6 +348,52 @@ stamp it yourself.
 > The type was named `ProductContext` before netctl#737 and collided with
 > `delivery.context.ProductContext`; it is now `StepFactoryContext`, with a back-compat `ProductContext`
 > alias kept until consumers migrate.
+
+### 4f. Deploying a compose stack — the kernel reads, the product decides
+
+If your product deploys containers with `docker compose`, `delivery.compose` answers the questions a
+deployment command has to ask, and asks them of the RESOLVED document (`docker compose config --format
+json`) rather than of your env files. That distinction is load-bearing: the shell environment overrides
+an `--env-file`, so an exported credential or a stray `secrets.env` is invisible in the files and present
+in the resolution. Reading it needs no docker daemon (`config` is client-side), so the guards work on a
+stopped host.
+
+Every function is pure over that mapping, and every product-specific name arrives as an argument — there
+is no `PROXY_SERVICE`, `HEALTH_PATH`, `CREDENTIAL_KEYS`, `BACKUP_MOUNT` or `IMAGE_UID` in the kernel,
+because those are your data:
+
+```python
+from delivery import compose, log, waits
+
+# YOUR constants, in your product's orchestrator - the kernel has none of them
+PROXY, BACKEND, HEALTH_PATH, IMAGE_UID = "proxy", "backend", "/api/v1/health", 1000
+SECRETS = ("SMALLINVOICE_CLIENT_ID", "TOGGL_API_TOKEN")
+
+config = json.loads(run([*compose_argv, "config", "--format", "json"], capture=True).out)
+
+# a preflight: docker would create a missing bind source ROOT-owned, and the image runs as IMAGE_UID
+missing = compose.missing_bind_sources(config, BACKEND, os.path.exists)
+if missing:
+    log.die(f"create these first, owned by uid {IMAGE_UID}: {', '.join(missing)}")
+for path in compose.foreign_owner_bind_sources(config, BACKEND, _owner_uid, uid=IMAGE_UID):
+    log.warn(f"{path} is not owned by uid {IMAGE_UID}; it will fail on its first write")
+
+# a guard: is this instance seeing variables it must not? The READING is the kernel's, the RULE yours
+offenders = compose.assigned_variables(compose.service_environment(config, BACKEND), SECRETS)
+
+# a probe address nobody configured: it follows what compose actually published
+healthy, detail = waits.await_http(compose.health_url(config, PROXY, HEALTH_PATH), budget_s=30)
+```
+
+The rest of the module answers the same shape of question: `service`, `service_environment`,
+`bind_sources` (all, or `writable_only`), `published_endpoint`, and `snapshot_container_path` — which
+translates a file an operator names on the HOST into the path a one-off container sees under its mount,
+and refuses anything outside it.
+
+What stays yours: the env-file layering that builds the compose argv (those paths are your layout), the
+`docker compose config` invocation, and every RULE — whether a set variable is fatal, which environment
+is exempt, what the message says. The kernel knows how to read a resolved document; it must not know
+what your instances are for.
 
 ---
 
