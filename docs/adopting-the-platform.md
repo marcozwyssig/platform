@@ -106,6 +106,17 @@ git submodule add https://github.com/marcozwyssig/platform.git lib/platform
 generated manifest validates through `delivery.orchestrator.manifest.load` — the CLI is assembled
 from data, not hand-written.
 
+**Adopting into an EXISTING repo: where `orchestrator/` lands.** The scaffolder writes the block at the
+repo **top level** (`orchestrator/`), which is right for a fresh product and wrong for a repo that has a
+rule about what may sit there — netctl moved it to `deploy/provision/orchestrator/`, and so did
+biz-cockpit. Scaffolding into an existing tree is safe regardless: `delivery.bootstrap.write()` refuses to
+overwrite anything without `--force`, so a hand-edited manifest or shim is never clobbered; only the
+placement needs follow-up. Relocating costs **three lines**, all of them outside the package — the Python
+side self-locates by walking up to the `<product>.yaml` marker (§4a) and needs no edit: the
+`-r ../lib/platform/…` count in `orchestrator/requirements.txt` (one `../` per extra level, §5), and
+`PYTHONPATH=…/orchestrator/src/python` plus `LAUNCH_ORCH_DIR=…/orchestrator` in `<product>.sh`. Move the
+directory, retune those three, and `./<product>.sh help` runs from the new location.
+
 ---
 
 ## 3. The manifest: nested groups → commands → spec
@@ -283,8 +294,7 @@ def down() -> None: ...
 
 # assemble at import: binds each manifest command's callback onto `app` (step_context binds the
 # impl-less aggregates, see §4e)
-delivery_cli.assemble(app, paths.CONTEXT.manifest(), product=paths.CONTEXT.name,
-                      step_context=_STEP_CONTEXT)
+delivery_cli.assemble(app, _MANIFEST, product=paths.CONTEXT.name, step_context=_STEP_CONTEXT)
 
 def main() -> None:                           # `python -m orchestrator`
     delivery_cli.main(app=app, context=paths.CONTEXT,
@@ -304,13 +314,13 @@ identity context - it carries a command-name → `Step` factory) via `assemble(s
 
 ```python
 from delivery.orchestrator.product import StepFactoryContext
-from delivery.orchestrator.steps import argv_step
 
-# a command NAME → a live-streamed `./fooctl.sh <cmd>` step
-_STEP_CONTEXT = StepFactoryContext("fooctl", lambda cmd: argv_step(cmd, [str(paths.ROOT / "fooctl.sh"), cmd]))
+_MANIFEST = paths.CONTEXT.manifest()          # read once: assembled from, and resolved against
 
-delivery_cli.assemble(app, paths.CONTEXT.manifest(), product=paths.CONTEXT.name,
-                      step_context=_STEP_CONTEXT)
+# a command NAME → a live-streamed `./fooctl.sh <cmd>` step, stamped with that command's dotted identity
+_STEP_CONTEXT = StepFactoryContext.for_shim("fooctl", paths.ROOT / "fooctl.sh", _MANIFEST)
+
+delivery_cli.assemble(app, _MANIFEST, product=paths.CONTEXT.name, step_context=_STEP_CONTEXT)
 ```
 
 Add your own aggregates by declaring impl-less `depends_on` commands in the manifest - no product
@@ -325,7 +335,11 @@ declared without it.
 Your factory must stamp each `Step` with the leaf's exact-command identity (`command=`, the dotted
 `group.command` path or the bare name). The kernel verifies the leaf-to-step pairing through it before it
 trusts the tree for anything, and a step that names nothing is unverifiable: the whole tree is then
-dropped, with a warning, back to a flat list and the single root-level `stop_on_failure`.
+dropped, with a warning naming the offending step, back to a flat list and the single root-level
+`stop_on_failure` — so a `lint → check-contract → test` chain runs on after a failure instead of stopping
+(#42). `for_shim` does the stamping for you (`manifest.path_by_name(cmd)`, falling back to the bare name
+for a command several groups own); write your own factory only for a step that is not a shim call, and
+stamp it yourself.
 
 > The type was named `ProductContext` before netctl#737 and collided with
 > `delivery.context.ProductContext`; it is now `StepFactoryContext`, with a back-compat `ProductContext`
@@ -414,3 +428,9 @@ four are now fixed in the scaffolder, so a freshly bootstrapped product is corre
 - **The `ProductContext` name clash is gone.** The step-factory type is now
   `StepFactoryContext` (a back-compat `ProductContext` alias remains until consumers migrate), distinct
   from the identity `delivery.context.ProductContext` (§4e).
+
+One more of the same kind surfaced later, when biz-cockpit adopted the platform (#42): the scaffolded
+step factory built its steps **without `command=`**, so the kernel could not verify the leaf-to-step
+pairing and dropped every plan tree it was handed — silently voiding each subtree's `stop_on_failure`.
+The scaffold now uses `StepFactoryContext.for_shim`, which stamps the identity (§4e), and a product that
+was adopted against an older scaffold fixes it by switching its own factory to the same call.
