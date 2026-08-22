@@ -17,13 +17,12 @@ jobs:
         with:
           python-version: "3.13"
       - name: Install test dependencies
-        # The full delivery test dep set, mirroring the KERNEL's own runtime pins in
-        # src/delivery/requirements.txt - not a consumer's test venv. A product's unit gate collects its
-        # own test roots, never this block, so it has no reason to carry a dependency only these tests
-        # import (netctl's has no textual, correctly). The S1/S2 topology + clabrender tests need jinja2 +
-        # cryptography, test_cli needs click/typer (click pinned <8.2 for typer 0.12.5's make_metavar
-        # signature), and textual is what makes this the ONLY gate that exercises the TUI runner
-        # (test_orchestrator_tui importorskips it). Without these the collection errored on those modules.
-        run: pip install pytest pyyaml textual "pydantic==2.13.4" jinja2 cryptography "typer==0.12.5" "click==8.1.7"
+        # Install the kernel's OWN pins rather than a hand-copied list. The copy that stood here had
+        # already drifted (textual, jinja2 and cryptography were unpinned; rich was missing), and adding
+        # invoke to requirements.txt for netctl#1434 never reached this gate - the collection errored on
+        # the two new test modules while netctl's own gate, which does read the file, was green. A gate
+        # that can disagree with the dependency declaration it exists to verify is worth less than it
+        # looks. pytest is separate because it is a TEST dep, not a kernel runtime one.
+        run: pip install pytest -r src/delivery/requirements.txt
       - name: Run the delivery unit tests
         run: python -m pytest src/delivery/test/unit/python -v
