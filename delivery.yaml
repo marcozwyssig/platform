@@ -1,0 +1,55 @@
+# The delivery kernel's task catalogue (netctl#1437): the coordinate space between the platform and a
+# *ctl product. A product imports a NAMESPACE and refers to `<namespace>:<name>`, never to a module path,
+# so a body can move inside the kernel without breaking a product manifest.
+#
+# The kernel generates no module of its own - it has no CLI, only bodies and this registry. Only a
+# product generates, because only a product has a surface.
+#
+# Exactly the ten coordinates netctl references today, no more. A catalogue that offers what nobody
+# imports is speculation, and the design's own rule is the minimum that solves the problem.
+#
+# `help:` here is the fallback wording. A product's own `help:` wins where it declares one, and for a
+# non-shared body the CLI summary comes from the body's DOCSTRING anyway (see delivery.taskgen).
+
+tasks:
+
+  # --- vcs: the version-control verbs -----------------------------------------------------------------
+  vcs:commit:
+    impl: delivery.commands.vcs:commit
+    help: "git add -A + git commit -m."
+  vcs:push:
+    impl: delivery.commands.vcs:push
+    help: "git pull --rebase then push (current branch)."
+  vcs:prune-branches:
+    impl: delivery.commands.vcs:prune_branches
+    help: "Delete local branches already merged into main (squash-aware via gh)."
+  vcs:submodules:
+    impl: delivery.commands.vcs:submodules
+    help: "git submodule update --init lib/platform (init the delivery-kernel submodule a fresh worktree needs)."
+
+  # --- test: the suite runner ------------------------------------------------------------------------
+  # `gate` backs EVERY declared suite level: one body, several commands, each identifying itself by the
+  # name it was invoked as (netctl#1406). A product declares one entry per level and overrides the help,
+  # which is the case the shared-impl rule in delivery.taskgen exists for.
+  test:gate:
+    impl: delivery.commands.testrun:gate
+    help: "Run a declared pytest suite against the running lab."
+    passthrough_args: true
+  test:report:
+    impl: delivery.commands.testrun:report_cmd
+    help: "Merge the unit results into the shared Allure results and render the HTML archive."
+  test:accept:
+    impl: delivery.commands.testrun:accept_cmd
+    help: "Run the lab-based suites in sequence against the running lab."
+    passthrough_args: true
+
+  # --- support: host and tooling upkeep ---------------------------------------------------------------
+  support:nexus:
+    impl: delivery.commands.nexus:nexus_cmd
+    help: "Drive the LAN Sonatype Nexus artefact proxy: up | down | status | repos | cleanup."
+  support:claude-plugins:
+    impl: delivery.commands.claudeplugins:install_cmd
+    help: "Install the Claude Code plugins declared in the manifest's `claude` section; idempotent."
+  support:environments:
+    impl: delivery.commands.env:environments
+    help: "List the named environments and the backend each targets, marking the active one."
