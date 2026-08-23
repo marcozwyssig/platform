@@ -25,6 +25,8 @@ ValidationError as a plain ValueError so a raw ValidationError never escapes.
 """
 from __future__ import annotations
 
+import re
+
 import importlib
 from typing import Callable, NamedTuple
 
@@ -89,6 +91,23 @@ class CommandSpec(NamedTuple):
     keep_awake: bool = False
     hidden: bool = False
     with_: dict[str, object] = {}
+    params: dict[str, "ParamPresentation"] = {}
+
+
+class ParamPresentation(NamedTuple):
+    """How a parameter is PRESENTED, never what it is (netctl#1437).
+
+    The signature - name, type, default - is introspected from the body; declaring it in YAML would state
+    it twice and let the two drift, which is the failure `impl:` already has. Its help text and its short
+    flag are a different kind of thing: user-facing copy that exists nowhere in the signature, and the
+    short flag in particular has no docstring form. They lived inside `typer.Option(...)` in the command
+    body until the bodies became framework-free, and this is where they went.
+
+    Only these two keys are accepted, so a `type:` or `default:` cannot bring the drift back through this
+    door.
+    """
+    help: str | None = None
+    short: str | None = None
 
 
 class Manifest(NamedTuple):
@@ -288,6 +307,31 @@ def _split_impl(impl: str, context: str) -> tuple[str, str]:
 # manifest-level `@model_validator` so the message can carry that name (the tests assert on those strings).
 
 
+class _ParamPresentationModel(BaseModel):
+    """Parse/validate view of one `params:` entry. Unlike every other spec model here this FORBIDS extra
+    keys rather than ignoring them: the whole point of the block is that it cannot express a signature,
+    and a silently dropped `default:` would read to its author as if it had been honoured."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    help: str | None = None
+    short: str | None = None
+
+    @field_validator("help", mode="before")
+    @classmethod
+    def _stripped_or_none(cls, value: object) -> str | None:
+        return None if value is None else str(value).strip()
+
+    @field_validator("short")
+    @classmethod
+    def _single_dashed_letter(cls, value: str | None) -> str | None:
+        # Click accepts more than this, and renders some of it unrecognisably; `--dry-run` in the SHORT
+        # slot would silently duplicate the long decl the generator derives from the parameter name.
+        if value is not None and not re.fullmatch(r"-[A-Za-z]", value):
+            raise ValueError(f"short flag {value!r} must be a single dash plus one letter, e.g. '-n'")
+        return value
+
+
 class _CommandSpecModel(BaseModel):
     """Parse/validate view of one command declaration. Coerces the scalars exactly like the former loader
     and IGNORES unknown keys inside a spec. The non-empty-impl/help and 'module:function' rules live on the
@@ -298,6 +342,7 @@ class _CommandSpecModel(BaseModel):
     impl: str = ""
     help: str = ""
     with_: dict[str, object] = Field(default_factory=dict, alias="with")
+    params: dict[str, _ParamPresentationModel] = Field(default_factory=dict)
     passthrough_args: bool = False
     depends_on: tuple[str, ...] = ()
     stop_on_failure: bool = False
@@ -573,7 +618,7 @@ def _validation_message(error: ValidationError) -> str:
     return f"{location}: {message}" if location else message
 
 
-def load(text: str, *, validate_with: bool = False) -> Manifest:
+def load(text: str, *, validate_with: bool = False, catalogue: object = None) -> Manifest:
     """Parse a product manifest YAML into a validated Manifest (pure: no import of the impls, no Typer).
 
     Validates through the private `_ManifestModel`, failing loudly with ValueError so a bad manifest is
@@ -597,6 +642,12 @@ def load(text: str, *, validate_with: bool = False) -> Manifest:
         differing policy, which is why the rule is scoped per plan rather than manifest-wide;
       - `hidden` (netctl#1277) is rejected on a group-default group's NAMESAKE member, because that member
         never reaches the registration `delivery.cli.assemble` would apply it to.
+
+    `catalogue` (netctl#1437) supplies the platform's coordinate space so an `import:` + `tasks:` pair can
+    be expanded into `groups:` BEFORE validation - which is the point of expanding there rather than
+    afterwards: every rule above then applies to an imported command exactly as it does to a declared one.
+    With no catalogue the behaviour is exactly today's, which is what lets a product adopt the mechanism
+    one command at a time.
     Unknown top-level keys stay ignored (backward compatible), with ONE exception: a leftover `composites:`
     key is rejected loudly (the concept was removed in netctl#898; declare an impl-less aggregate command
     with `depends_on` instead) - silently dropping it would turn a still-declared pipeline into dead data.
@@ -606,6 +657,7 @@ def load(text: str, *, validate_with: bool = False) -> Manifest:
     spec tree (group -> command -> spec).
     """
     data = yaml.safe_load(text) or {}
+    data = _expand_imports(data, catalogue)
     try:
         model = _ManifestModel.model_validate(data)
     except ValidationError as exc:
@@ -615,7 +667,9 @@ def load(text: str, *, validate_with: bool = False) -> Manifest:
     commands = {
         group: {name: CommandSpec(impl=spec.impl, help=spec.help, passthrough_args=spec.passthrough_args,
                                   depends_on=spec.depends_on, stop_on_failure=spec.stop_on_failure,
-                                  keep_awake=spec.keep_awake, hidden=spec.hidden, with_=spec.with_)
+                                  keep_awake=spec.keep_awake, hidden=spec.hidden, with_=spec.with_,
+                                  params={pname: ParamPresentation(help=p.help, short=p.short)
+                                          for pname, p in spec.params.items()})
                 for name, spec in members.items()}
         for group, members in model.groups.items()
     }
@@ -632,8 +686,64 @@ def load(text: str, *, validate_with: bool = False) -> Manifest:
                 f"groups entry '{name}' names a nested group the `taxonomy:` block does not declare - "
                 f"declare it there, or move its commands to a top-level group")
     if validate_with:
-        _validate_with_bindings(commands)
+        _validate_param_bindings(commands)
     return Manifest(groups=groups, env_groups=env_groups, commands=commands, tree=tree)
+
+
+def _expand_imports(data: dict, catalogue: object) -> dict:
+    """Fold a manifest's `import:` + `tasks:` sections into `groups:`.
+
+    `tasks:` carries two kinds of entry, told apart by the presence of `impl:`, deliberately in ONE
+    section rather than two that could drift:
+
+      - WITH `impl:` - a DEFINITION, the product's own body. Its key is the command name.
+      - WITHOUT     - an OVERRIDE of an imported coordinate. Its key IS the coordinate, and if no import
+                      offers it that is a typo, loud here rather than a silently missing command.
+
+    A command lands in the group its coordinate's namespace names unless `group:` says otherwise, so a
+    product places a task without restating anything else about it.
+    """
+    imports, tasks = data.get("import") or {}, data.get("tasks") or {}
+    if not imports and not tasks:
+        return data
+    if catalogue is None and (imports or any(not (spec or {}).get("impl") for spec in tasks.values())):
+        # Both halves matter. Without the first, an `import:` with no catalogue reached
+        # `catalogue.namespace(...)` on None and died as an AttributeError deep in the expansion rather
+        # than as the manifest error it is; without the second, an override would resolve against an
+        # empty map and be reported as a typo when the real fault is a caller that passed no catalogue.
+        raise ValueError("manifest declares `import:` or imported tasks, but load() was given no "
+                         "catalogue - pass catalogue=delivery.catalogue.load()")
+
+    available: dict[str, dict] = {}
+    for source, namespaces in imports.items():
+        if source != "delivery":
+            raise ValueError(f"unknown import source '{source}' - the only catalogue is 'delivery'")
+        for namespace in namespaces or ():
+            for name, spec in catalogue.namespace(namespace).items():
+                available[f"{namespace}:{name}"] = spec
+
+    expanded = {group: dict(members) for group, members in (data.get("groups") or {}).items()}
+    for key, spec in tasks.items():
+        spec = dict(spec or {})
+        group = spec.pop("group", None)
+        if spec.get("impl"):
+            if ":" in str(key):
+                raise ValueError(f"task '{key}' declares an impl, so its key is a command NAME, not a "
+                                 f"coordinate - a coordinate is what the CATALOGUE assigns")
+            name = str(key)
+        else:
+            if key not in available:
+                raise ValueError(
+                    f"task '{key}' declares no impl, so it overrides an imported coordinate - and none "
+                    f"is imported under that name" +
+                    (f" (imported: {', '.join(sorted(available))})" if available else ""))
+            namespace, name = str(key).split(":", 1)
+            spec = {**available[key], **spec}
+            group = group or namespace
+        if not group:
+            raise ValueError(f"task '{key}' names no group")
+        expanded.setdefault(group, {})[name] = spec
+    return {**data, "groups": expanded}
 
 
 def _catalogue_tree(declared: dict[str, dict],
@@ -669,30 +779,33 @@ def _flat_tree(members: dict[str, tuple[str, ...]],
             for name, cmds in members.items() if "." not in name}
 
 
-def _validate_with_bindings(commands: dict[str, dict[str, "CommandSpec"]]) -> None:
-    """Reject a `with:` key that is not a parameter of the command's impl.
+def _validate_param_bindings(commands: dict[str, dict[str, "CommandSpec"]]) -> None:
+    """Reject a `with:` or `params:` key that is not a parameter of the command's impl.
 
-    This is the check that makes `with:` worth having: without it a typo is a silently ignored override,
-    which is the failure mode the task generator exists to remove. It costs an IMPORT of every impl that
-    binds one, which is why it is opt-in - the pure-parse tests must stay import-free - and why the
-    generator always turns it on.
+    This is the check that makes both blocks worth having: without it a typo is a silently ignored
+    override, or a help text the author wrote and no user will ever see - which is the failure mode the
+    generator exists to remove. It costs an IMPORT of every impl that binds one, which is why it is
+    opt-in - the pure-parse tests must stay import-free - and why the generator always turns it on.
+
+    Both maps are checked against ONE walk of the signature rather than two, so they cannot come to
+    disagree about what a parameter is.
     """
     from delivery import signatures      # lazy: taskgen/signatures must not be a load-time dependency
 
     for group, members in commands.items():
         for name, spec in members.items():
-            if not spec.with_ or not spec.impl:
+            if not spec.impl or not (spec.with_ or spec.params):
                 continue
             body = resolve_ref(spec.impl, f"{group} {name}")
             # BINDABLE parameters only, the same set the generator will substitute into. Using every
-            # signature name accepted `with: {c: ...}` - binding the Invoke Context, the likeliest real
+            # signature name accepted `with: {c: ...}` - binding the CLI context, the likeliest real
             # typo - and the generator then discarded it silently.
             params = {p.name for p in signatures.bindable(body)}
-            unknown = sorted(set(spec.with_) - params)
+            unknown = sorted((set(spec.with_) | set(spec.params)) - params)
             if unknown:
                 raise ValueError(
-                    f"`{group} {name}` binds `with:` key(s) {', '.join(unknown)} that are not parameters "
-                    f"of {spec.impl} (it takes: {', '.join(sorted(params))})")
+                    f"`{group} {name}` binds key(s) {', '.join(unknown)} that are not parameters "
+                    f"of {spec.impl} (it takes: {', '.join(sorted(params)) or 'none'})")
 
 
 def resolve_ref(ref: str, where: str) -> Callable[..., object]:
