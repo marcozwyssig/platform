@@ -5,7 +5,7 @@
 # The kernel generates no module of its own - it has no CLI, only bodies and this registry. Only a
 # product generates, because only a product has a surface.
 #
-# Exactly the ten coordinates netctl references today, no more. A catalogue that offers what nobody
+# Exactly the twelve coordinates netctl references today, no more. A catalogue that offers what nobody
 # imports is speculation, and the design's own rule is the minimum that solves the problem.
 #
 # `help:` here is the fallback wording. A product's own `help:` wins where it declares one, and for a
@@ -53,3 +53,14 @@ tasks:
   support:environments:
     impl: delivery.commands.env:environments
     help: "List the named environments and the backend each targets, marking the active one."
+
+  # --- tasks: the task machinery, addressable ---------------------------------------------------------
+  # `generate` writes the product's committed CLI module; `catalogue` prints this file. Both are kernel
+  # mechanisms: what is product-specific reaches them through delivery.context and a manifest-pinned
+  # `with: { target: ... }`, never through an import.
+  tasks:generate:
+    impl: delivery.commands.tasks:generate
+    help: "Regenerate the product's CLI module from its manifest (--check reports drift and writes nothing)."
+  tasks:catalogue:
+    impl: delivery.commands.tasks:catalogue
+    help: "List the task coordinates the delivery kernel offers, marking the namespaces this product imports."
