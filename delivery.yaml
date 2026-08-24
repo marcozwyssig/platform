@@ -13,12 +13,16 @@
 
 # The CI/CD loop's SHAPE, owned by the platform (netctl#1444, spec step 7). Every *ctl product runs the
 # same build -> test -> release -> deploy -> monitor loop, so declaring it once here beats each product
-# restating it. A product contributes MEMBERS to these groups through its own `groups:` keys and never
-# redeclares their shape; declaring one here AND in a product manifest is a contradiction the loader
-# rejects, which is what lets the tree move over one group at a time.
+# restating it. A product contributes MEMBERS to these groups through its own `groups:` keys.
 #
-# Migrating one group per diff, as the design asks. `build` is first because it is the least entangled:
-# no env-gating, and netctl's is a group-default group, which is the shape most likely to break.
+# THIS BLOCK IS THE COMPLETE LIST OF GROUPS (netctl#1462). While it is present the loader refuses both a
+# bare `groups:` key that names something absent from it and a product's own `taxonomy:` block, so a
+# product can add TASKS freely but cannot add a GROUP. That is the point: someone moving between two
+# *ctl products finds the same groups holding the same general tasks. A genuinely new group is added
+# HERE, once, and every product gets it - which also means adding one is a decision about all of them.
+#
+# The lock is conditional on this block existing, so a product on a tasks-only catalogue keeps its own
+# tree and can adopt the shape in its own time.
 taxonomy:
   build:   { help: "Produce the artefacts." }
   test:    { help: "Verify them." }
