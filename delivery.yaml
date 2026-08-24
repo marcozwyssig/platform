@@ -11,6 +11,26 @@
 # `help:` here is the fallback wording. A product's own `help:` wins where it declares one, and for a
 # non-shared body the CLI summary comes from the body's DOCSTRING anyway (see delivery.taskgen).
 
+# The CI/CD loop's SHAPE, owned by the platform (netctl#1444, spec step 7). Every *ctl product runs the
+# same build -> test -> release -> deploy -> monitor loop, so declaring it once here beats each product
+# restating it. A product contributes MEMBERS to these groups through its own `groups:` keys and never
+# redeclares their shape; declaring one here AND in a product manifest is a contradiction the loader
+# rejects, which is what lets the tree move over one group at a time.
+#
+# Migrating one group per diff, as the design asks. `build` is first because it is the least entangled:
+# no env-gating, and netctl's is a group-default group, which is the shape most likely to break.
+taxonomy:
+  build:   { help: "Produce the artefacts." }
+  test:    { help: "Verify them." }
+  release: { help: "Publish them." }
+  deploy:  { help: "Put them into an environment.", env_first: true }
+  monitor: { help: "Watch what is running there.", env_first: true }
+  support:
+    help: "Host preflight, environment introspection and host tooling."
+    groups:
+      git: { help: "Version-control helpers." }
+  tasks:   { help: "The task machinery itself: regenerate the CLI module, list the coordinates." }
+
 tasks:
 
   # --- vcs: the version-control verbs -----------------------------------------------------------------
