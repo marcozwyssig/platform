@@ -14,7 +14,7 @@ the product repo, not here.
 The rule runs in both directions (netctl#1280): an impl belongs HERE as soon as it needs no product
 knowledge, and a product forwarding function that only re-exports a kernel call is a shim, not a
 seam. Product data reaches such an impl through `delivery.context.current()` and the manifest, never
-through an import - `delivery/commands/` holds the Typer callbacks a product's manifest points its
+through an import - `delivery/tasks/` holds the Typer callbacks a product's manifest points its
 `impl:` straight at.
 
 ## HARD naming rule
@@ -35,7 +35,7 @@ src/consensus/                     Java lib block
 src/delivery/                      Python lib block
   src/python/delivery/             Python shared core
     orchestrator/                  steps runner + TUI + manifest assembly
-    commands/                      product-agnostic CLI command impls a product's manifest points
+    tasks/                         product-agnostic CLI command impls a product's manifest points
                                    `impl:` straight at (Typer callbacks; product data arrives via
                                    delivery.context, never via an import of the product)
     (clitaxonomy, compose, environments, degraded, disk, diskguard, host, interact,

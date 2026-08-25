@@ -39,16 +39,16 @@ tasks:
 
   # --- vcs: the version-control verbs -----------------------------------------------------------------
   vcs:commit:
-    impl: delivery.commands.vcs:commit
+    impl: delivery.tasks.vcs:commit
     help: "git add -A + git commit -m."
   vcs:push:
-    impl: delivery.commands.vcs:push
+    impl: delivery.tasks.vcs:push
     help: "git pull --rebase then push (current branch)."
   vcs:prune-branches:
-    impl: delivery.commands.vcs:prune_branches
+    impl: delivery.tasks.vcs:prune_branches
     help: "Delete local branches already merged into main (squash-aware via gh)."
   vcs:submodules:
-    impl: delivery.commands.vcs:submodules
+    impl: delivery.tasks.vcs:submodules
     help: "git submodule update --init lib/platform (init the delivery-kernel submodule a fresh worktree needs)."
 
   # --- test: the suite runner ------------------------------------------------------------------------
@@ -56,26 +56,26 @@ tasks:
   # name it was invoked as (netctl#1406). A product declares one entry per level and overrides the help,
   # which is the case the shared-impl rule in delivery.taskgen exists for.
   test:gate:
-    impl: delivery.commands.testrun:gate
+    impl: delivery.tasks.testrun:gate
     help: "Run a declared pytest suite against the running lab."
     passthrough_args: true
   test:report:
-    impl: delivery.commands.testrun:report_cmd
+    impl: delivery.tasks.testrun:report_cmd
     help: "Merge the unit results into the shared Allure results and render the HTML archive."
   test:accept:
-    impl: delivery.commands.testrun:accept_cmd
+    impl: delivery.tasks.testrun:accept_cmd
     help: "Run the lab-based suites in sequence against the running lab."
     passthrough_args: true
 
   # --- support: host and tooling upkeep ---------------------------------------------------------------
   support:nexus:
-    impl: delivery.commands.nexus:nexus_cmd
+    impl: delivery.tasks.nexus:nexus_cmd
     help: "Drive the LAN Sonatype Nexus artefact proxy: up | down | status | repos | cleanup."
   support:claude-plugins:
-    impl: delivery.commands.claudeplugins:install_cmd
+    impl: delivery.tasks.claudeplugins:install_cmd
     help: "Install the Claude Code plugins declared in the manifest's `claude` section; idempotent."
   support:environments:
-    impl: delivery.commands.env:environments
+    impl: delivery.tasks.env:environments
     help: "List the named environments and the backend each targets, marking the active one."
 
   # --- tasks: the task machinery, addressable ---------------------------------------------------------
@@ -83,8 +83,8 @@ tasks:
   # mechanisms: what is product-specific reaches them through delivery.context and a manifest-pinned
   # `with: { target: ... }`, never through an import.
   tasks:generate:
-    impl: delivery.commands.tasks:generate
+    impl: delivery.tasks.tasks:generate
     help: "Regenerate the product's CLI module from its manifest (--check reports drift and writes nothing)."
   tasks:catalogue:
-    impl: delivery.commands.tasks:catalogue
+    impl: delivery.tasks.tasks:catalogue
     help: "List the task coordinates the delivery kernel offers, marking the namespaces this product imports."
