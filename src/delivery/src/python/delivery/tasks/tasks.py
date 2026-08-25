@@ -64,11 +64,21 @@ def catalogue() -> int:
     see what is on offer, which is what this prints - namespace by namespace, each coordinate with the
     kernel's own one-line summary, and a marker on the namespaces this product's manifest imports.
     """
+    # KEPT VERBATIM as a COMMENT rather than fixed prose (netctl#1469 fix round 1): the whole docstring
+    # above - not only its first line - is embedded into the generated module's `help=` for this command
+    # (taskgen._docstring keeps the BODY's docstring whenever it is bound to only one command), and its
+    # FIRST PARAGRAPH specifically is also netctl's CLI-surface golden's "summary:" line for `netctl
+    # catalogue`/`netctl tasks catalogue`. Rewording either would move that golden, or leak this
+    # migration's internal reasoning into a product's `--help` text, for an unmigrated netctl with no
+    # netctl-side change to pair it with - the same failure class change 3's docstring comment records
+    # for the `name` parameter. "Imports" is no longer the full picture below - `_reached_namespaces`
+    # also counts a `task:` reference - but the docstring stays exactly as it was; only the code and the
+    # rest of this module's wording change.
     cat = catalogue_mod.load()
-    imported = _imported_namespaces(context.current().manifest_data())
+    reached = _reached_namespaces(context.current().manifest_data())
 
     for namespace in cat.namespaces():
-        mark = " (imported)" if namespace in imported else ""
+        mark = " (reached)" if namespace in reached else ""
         print(f"{namespace}{mark}")
         tasks = cat.namespace(namespace)
         width = max(len(name) for name in tasks)
@@ -78,13 +88,55 @@ def catalogue() -> int:
     return 0
 
 
-def _imported_namespaces(data: dict) -> frozenset[str]:
-    """The namespaces a product's raw manifest imports from the delivery catalogue.
+def _reached_namespaces(data: dict) -> frozenset[str]:
+    """The namespaces a product's manifest reaches, from EITHER of the two mechanisms that coexist for
+    as long as a migration to the command tree takes (netctl#1469 plan 2).
 
-    Read from the RAW mapping rather than the parsed manifest on purpose: `import:` is folded into
-    `groups:` during loading and is gone by the time the parsed form exists, so the parsed manifest cannot
-    answer which namespaces were named. A product that imports nothing yields an empty set rather than an
-    error - naming no coordinate is a legitimate state, and the listing is still worth printing.
+    A wholly-migrated manifest names a coordinate under `task:`; a wholly-unmigrated one still places a
+    platform coordinate the OLD way, via `import:` + a bare `tasks:` override that only becomes `impl:`
+    later, inside `_expand_imports` - a step this function's RAW `data` (from `manifest_data()`) never
+    sees. Reading only the `task:` walk therefore marks NOTHING for a product like netctl, which has not
+    migrated a single group yet: a marker that is silently wrong is worse than one that is silently
+    absent, which is exactly the failure this union avoids. Both signals stay read until plan 3 deletes
+    the old form and `import:` along with it.
+    """
+    return _task_ref_namespaces(data) | _import_namespaces(data)
+
+
+def _task_ref_namespaces(data: dict) -> frozenset[str]:
+    """The namespaces a `task:` coordinate reaches anywhere in the raw `groups:` tree.
+
+    Walked generically rather than via `treeform`'s node-shaped walk, because the raw tree can be a MIX
+    of old-form groups (no `task:` concept at all) and new-form ones for as long as a migration takes
+    (plan 2's per-group partition) - a plain recursive walk over whatever nesting is there needs no
+    knowledge of which shape a given node is in. A `task:` value containing a colon is a platform
+    coordinate ("namespace:name"); a bare name refers to a task the manifest defines itself and carries
+    no namespace to report.
+    """
+    found: set[str] = set()
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            ref = node.get("task")
+            if isinstance(ref, str) and ":" in ref:
+                found.add(ref.split(":", 1)[0])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk((data or {}).get("groups") or {})
+    return frozenset(found)
+
+
+def _import_namespaces(data: dict) -> frozenset[str]:
+    """The namespaces the OLD form's `import: { delivery: [...] }` list names.
+
+    The pre-netctl#1469 mechanism: `import:` makes a namespace's coordinates available, and a product
+    places one under `tasks:` by bare coordinate key, expanded into `impl:` later inside
+    `_expand_imports` - a step this function's RAW `data` never sees. Kept until plan 3 deletes
+    `import:` along with the rest of the old form.
     """
     section = (data or {}).get("import") or {}
     if not isinstance(section, dict):

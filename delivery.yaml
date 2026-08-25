@@ -110,4 +110,4 @@ tasks:
     help: "Regenerate the product's CLI module from its manifest (--check reports drift and writes nothing)."
   tasks:catalogue:
     impl: delivery.tasks.tasks:catalogue
-    help: "List the task coordinates the delivery kernel offers, marking the namespaces this product imports."
+    help: "List the task coordinates the delivery kernel offers, marking the namespaces this product's commands reach."

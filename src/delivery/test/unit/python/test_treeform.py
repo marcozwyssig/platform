@@ -3,8 +3,12 @@
 AAA throughout. Every rejection has a negative test, because a rule that only ever runs on valid input
 is a rule nobody has seen work.
 """
+import textwrap
+
 import pytest
 
+from delivery import catalogue as catalogue_mod
+from delivery.orchestrator import manifest
 from delivery.orchestrator.model import treeform
 
 
@@ -327,6 +331,116 @@ def test_a_non_mapping_with_block_is_rejected():
     # act / assert
     with pytest.raises(ValueError, match="`with:` as list, not a mapping"):
         treeform.resolve(flat, tasks, {})
+
+
+def test_a_block_with_both_forms_is_partitioned_by_top_level_key():
+    # arrange: the shape a migrating product has for exactly as long as the migration takes
+    groups = {"build": {"commands": {"web-image": {"task": "img"}}},
+              "test":  {"unit-java": {"impl": "orchestrator.cli:unit_java", "help": "h."}}}
+
+    # act
+    new, old = treeform.partition(groups)
+
+    # assert
+    assert set(new) == {"build"}
+    assert set(old) == {"test"}
+
+
+def test_a_wholly_old_form_block_partitions_to_nothing_new():
+    # arrange
+    groups = {"test": {"unit-java": {"impl": "a:b", "help": "h."}}}
+
+    # act
+    new, old = treeform.partition(groups)
+
+    # assert
+    assert new == {} and set(old) == {"test"}
+    assert treeform.is_new_form(groups) is False
+
+
+def test_a_mixed_manifest_loads_both_halves(tmp_path):
+    # arrange: the migration's central claim - a converted group and an unconverted one coexist
+    catalogue = catalogue_mod.loads(textwrap.dedent("""
+        tasks:
+          vcs:push: { impl: delivery.tasks.vcs:push, help: "push it." }
+        groups:
+          build: { help: "Produce the artefacts." }
+          test:  { help: "Verify them." }
+    """))
+    text = textwrap.dedent("""
+        product: demo
+        tasks:
+          img: { impl: "demo.tooling:image", help: "Build an image." }
+        groups:
+          build:
+            commands:
+              web-image: { task: img, with: { key: web }, help: "Build the web image." }
+          test:
+            unit-java: { impl: "demo.cli:unit_java", help: "Run the Java unit gate." }
+    """)
+
+    # act
+    mf = manifest.load(text, catalogue=catalogue)
+
+    # assert: both groups carry their member, and each resolved through its own path
+    assert mf.commands["build"]["web-image"].impl == "demo.tooling:image"
+    assert mf.commands["test"]["unit-java"].impl == "demo.cli:unit_java"
+
+
+def test_a_group_the_platform_places_a_command_in_while_the_product_keeps_it_old_form_is_rejected():
+    # arrange: `merge` seeds its output from EVERY catalogue group, not only the ones this manifest
+    # migrated, so `resolved` can carry a platform-placed command for a group ("test") the product has
+    # NOT touched at all - meanwhile the product's own `groups:` still declares "test" the old way, with
+    # its own members. A silent `{**resolved, **old_form}` would let one side vanish with no error.
+    catalogue = catalogue_mod.loads(textwrap.dedent("""
+        tasks:
+          test:unit-py: { impl: "delivery.tasks.x:y", help: "run the python gate." }
+        groups:
+          build: { help: "Produce the artefacts." }
+          test:  { help: "Verify them.", commands: { unit-py: { task: "test:unit-py", help: "run it." } } }
+    """))
+    text = textwrap.dedent("""
+        product: demo
+        tasks:
+          img: { impl: "demo.tooling:image", help: "Build an image." }
+        groups:
+          build:
+            commands:
+              web-image: { task: img, help: "Build the web image." }
+          test:
+            unit-java: { impl: "demo.cli:unit_java", help: "Run the Java unit gate." }
+    """)
+
+    # act / assert
+    with pytest.raises(ValueError, match="placed by the platform's command tree AND still declared"):
+        manifest.load(text, catalogue=catalogue)
+
+
+TASK_KEYS_OK = {"impl": "a:b", "help": "h.", "passthrough_args": True, "params": {"x": {"help": "y"}}}
+
+
+def test_a_task_declaring_every_allowed_key_is_accepted():
+    # arrange / act / assert: no exception
+    treeform.check_task("lab-image", TASK_KEYS_OK)
+
+
+def test_a_task_without_an_impl_is_rejected_by_name():
+    # arrange: today this dies as a bare KeyError deep inside resolve()
+    with pytest.raises(ValueError, match="declares no `impl:`"):
+        treeform.check_task("lab-image", {"help": "h."})
+
+
+def test_a_task_declaring_a_command_only_key_is_rejected():
+    # arrange: `hidden` is a real _CommandSpecModel key and reads as plausible on a template, which is
+    # exactly why silently dropping it is worse than refusing it
+    with pytest.raises(ValueError, match="belongs on a command"):
+        treeform.check_task("lab-image", {"impl": "a:b", "help": "h.", "hidden": True})
+
+
+def test_a_task_declaring_an_unknown_key_is_rejected():
+    # arrange
+    with pytest.raises(ValueError, match="unknown key"):
+        treeform.check_task("lab-image", {"impl": "a:b", "help": "h.", "helo": "typo"})
 
 
 def test_a_block_whose_nodes_carry_node_keys_is_new_form():
