@@ -11,19 +11,19 @@
 # `help:` here is the fallback wording. A product's own `help:` wins where it declares one, and for a
 # non-shared body the CLI summary comes from the body's DOCSTRING anyway (see delivery.taskgen).
 
-# The CI/CD loop's SHAPE, owned by the platform (netctl#1444, spec step 7). Every *ctl product runs the
-# same build -> test -> release -> deploy -> monitor loop, so declaring it once here beats each product
-# restating it. A product contributes MEMBERS to these groups through its own `groups:` keys.
+# The CI/CD loop, owned by the platform (netctl#1444, netctl#1469). Every *ctl product runs the same
+# build -> test -> release -> deploy -> monitor loop, so declaring it once here beats each product
+# restating it - and a product CANNOT restate it: `treeform.merge` rejects a path this block does not
+# declare, so the group lock is the structure rather than a check over it.
 #
-# THIS BLOCK IS THE COMPLETE LIST OF GROUPS (netctl#1462). While it is present the loader refuses both a
-# bare `groups:` key that names something absent from it and a product's own `taxonomy:` block, so a
-# product can add TASKS freely but cannot add a GROUP. That is the point: someone moving between two
-# *ctl products finds the same groups holding the same general tasks. A genuinely new group is added
-# HERE, once, and every product gets it - which also means adding one is a decision about all of them.
-#
-# The lock is conditional on this block existing, so a product on a tasks-only catalogue keeps its own
-# tree and can adopt the shape in its own time.
-taxonomy:
+# This block also PLACES the general commands, which is what makes "the same groups holding the same
+# general tasks" true rather than a convention every product has to keep by hand. It places only what
+# needs no product data: the four git verbs and the two task verbs. `support:nexus` reads a `nexus:`
+# section, `support:claude-plugins` a `claude:` one, `support:environments` an `environments:` one, and
+# `test:gate`/`test:accept` need a running lab - placed here, each would be a command that dies on its
+# first line in a product that has none of that. They stay tasks, and a product declares a command for
+# one the day it has the data.
+groups:
   build:   { help: "Produce the artefacts." }
   test:    { help: "Verify them." }
   release: { help: "Publish them." }
@@ -32,8 +32,31 @@ taxonomy:
   support:
     help: "Host preflight, environment introspection and host tooling."
     groups:
-      git: { help: "Version-control helpers." }
-  tasks:   { help: "The task machinery itself: regenerate the CLI module, list the coordinates." }
+      git:
+        help: "Version-control helpers."
+        commands:
+          commit:
+            task: "vcs:commit"
+            # `argument: true` is what keeps `message` a variadic POSITIONAL - without it Typer would
+            # render a single `--message TEXT`.
+            params:
+              message: { help: "commit message", argument: true }
+          push: { task: "vcs:push" }
+          prune-branches:
+            task: "vcs:prune-branches"
+            params:
+              dry_run:  { help: "preview only", short: "-n" }
+              remote:   { help: "also delete merged branches on origin" }
+              unmerged: { help: "ALSO delete branches that cannot be proven merged (destructive)" }
+          submodules: { task: "vcs:submodules" }
+  tasks:
+    help: "The task machinery itself: regenerate the CLI module, list the tasks."
+    commands:
+      catalogue: { task: "tasks:catalogue" }
+      generate:
+        task: "tasks:generate"
+        params:
+          check: { help: "report drift and write nothing" }
 
 tasks:
 
