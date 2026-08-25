@@ -11,19 +11,19 @@
 # `help:` here is the fallback wording. A product's own `help:` wins where it declares one, and for a
 # non-shared body the CLI summary comes from the body's DOCSTRING anyway (see delivery.taskgen).
 
-# The CI/CD loop's SHAPE, owned by the platform (netctl#1444, spec step 7). Every *ctl product runs the
-# same build -> test -> release -> deploy -> monitor loop, so declaring it once here beats each product
-# restating it. A product contributes MEMBERS to these groups through its own `groups:` keys.
+# The CI/CD loop, owned by the platform (netctl#1444, netctl#1469). Every *ctl product runs the same
+# build -> test -> release -> deploy -> monitor loop, so declaring it once here beats each product
+# restating it - and a product CANNOT restate it: `treeform.merge` rejects a path this block does not
+# declare, so the group lock is the structure rather than a check over it.
 #
-# THIS BLOCK IS THE COMPLETE LIST OF GROUPS (netctl#1462). While it is present the loader refuses both a
-# bare `groups:` key that names something absent from it and a product's own `taxonomy:` block, so a
-# product can add TASKS freely but cannot add a GROUP. That is the point: someone moving between two
-# *ctl products finds the same groups holding the same general tasks. A genuinely new group is added
-# HERE, once, and every product gets it - which also means adding one is a decision about all of them.
-#
-# The lock is conditional on this block existing, so a product on a tasks-only catalogue keeps its own
-# tree and can adopt the shape in its own time.
-taxonomy:
+# This block also PLACES the general commands, which is what makes "the same groups holding the same
+# general tasks" true rather than a convention every product has to keep by hand. It places only what
+# needs no product data: the four git verbs and the two task verbs. `support:nexus` reads a `nexus:`
+# section, `support:claude-plugins` a `claude:` one, `support:environments` an `environments:` one, and
+# `test:gate`/`test:accept` need a running lab - placed here, each would be a command that dies on its
+# first line in a product that has none of that. They stay tasks, and a product declares a command for
+# one the day it has the data.
+groups:
   build:   { help: "Produce the artefacts." }
   test:    { help: "Verify them." }
   release: { help: "Publish them." }
@@ -32,23 +32,46 @@ taxonomy:
   support:
     help: "Host preflight, environment introspection and host tooling."
     groups:
-      git: { help: "Version-control helpers." }
-  tasks:   { help: "The task machinery itself: regenerate the CLI module, list the coordinates." }
+      git:
+        help: "Version-control helpers."
+        commands:
+          commit:
+            task: "vcs:commit"
+            # `argument: true` is what keeps `message` a variadic POSITIONAL - without it Typer would
+            # render a single `--message TEXT`.
+            params:
+              message: { help: "commit message", argument: true }
+          push: { task: "vcs:push" }
+          prune-branches:
+            task: "vcs:prune-branches"
+            params:
+              dry_run:  { help: "preview only", short: "-n" }
+              remote:   { help: "also delete merged branches on origin" }
+              unmerged: { help: "ALSO delete branches that cannot be proven merged (destructive)" }
+          submodules: { task: "vcs:submodules" }
+  tasks:
+    help: "The task machinery itself: regenerate the CLI module, list the tasks."
+    commands:
+      catalogue: { task: "tasks:catalogue" }
+      generate:
+        task: "tasks:generate"
+        params:
+          check: { help: "report drift and write nothing" }
 
 tasks:
 
   # --- vcs: the version-control verbs -----------------------------------------------------------------
   vcs:commit:
-    impl: delivery.commands.vcs:commit
+    impl: delivery.tasks.vcs:commit
     help: "git add -A + git commit -m."
   vcs:push:
-    impl: delivery.commands.vcs:push
+    impl: delivery.tasks.vcs:push
     help: "git pull --rebase then push (current branch)."
   vcs:prune-branches:
-    impl: delivery.commands.vcs:prune_branches
+    impl: delivery.tasks.vcs:prune_branches
     help: "Delete local branches already merged into main (squash-aware via gh)."
   vcs:submodules:
-    impl: delivery.commands.vcs:submodules
+    impl: delivery.tasks.vcs:submodules
     help: "git submodule update --init lib/platform (init the delivery-kernel submodule a fresh worktree needs)."
 
   # --- test: the suite runner ------------------------------------------------------------------------
@@ -56,26 +79,26 @@ tasks:
   # name it was invoked as (netctl#1406). A product declares one entry per level and overrides the help,
   # which is the case the shared-impl rule in delivery.taskgen exists for.
   test:gate:
-    impl: delivery.commands.testrun:gate
+    impl: delivery.tasks.testrun:gate
     help: "Run a declared pytest suite against the running lab."
     passthrough_args: true
   test:report:
-    impl: delivery.commands.testrun:report_cmd
+    impl: delivery.tasks.testrun:report_cmd
     help: "Merge the unit results into the shared Allure results and render the HTML archive."
   test:accept:
-    impl: delivery.commands.testrun:accept_cmd
+    impl: delivery.tasks.testrun:accept_cmd
     help: "Run the lab-based suites in sequence against the running lab."
     passthrough_args: true
 
   # --- support: host and tooling upkeep ---------------------------------------------------------------
   support:nexus:
-    impl: delivery.commands.nexus:nexus_cmd
+    impl: delivery.tasks.nexus:nexus_cmd
     help: "Drive the LAN Sonatype Nexus artefact proxy: up | down | status | repos | cleanup."
   support:claude-plugins:
-    impl: delivery.commands.claudeplugins:install_cmd
+    impl: delivery.tasks.claudeplugins:install_cmd
     help: "Install the Claude Code plugins declared in the manifest's `claude` section; idempotent."
   support:environments:
-    impl: delivery.commands.env:environments
+    impl: delivery.tasks.env:environments
     help: "List the named environments and the backend each targets, marking the active one."
 
   # --- tasks: the task machinery, addressable ---------------------------------------------------------
@@ -83,8 +106,8 @@ tasks:
   # mechanisms: what is product-specific reaches them through delivery.context and a manifest-pinned
   # `with: { target: ... }`, never through an import.
   tasks:generate:
-    impl: delivery.commands.tasks:generate
+    impl: delivery.tasks.tasks:generate
     help: "Regenerate the product's CLI module from its manifest (--check reports drift and writes nothing)."
   tasks:catalogue:
-    impl: delivery.commands.tasks:catalogue
+    impl: delivery.tasks.tasks:catalogue
     help: "List the task coordinates the delivery kernel offers, marking the namespaces this product imports."

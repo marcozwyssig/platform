@@ -8,6 +8,8 @@ typo that offers nothing, an override matching no import, a coordinate with no n
 
 AAA throughout, including the negative cases.
 """
+import textwrap
+
 import pytest
 
 from delivery import catalogue
@@ -418,11 +420,11 @@ env_groups: []
 """
 
     # act / assert: the message has to name the way out, because "not allowed" alone leaves an author
-    # with a legitimate new group nowhere to go - the way out is the catalogue, where every product
-    # gets it.
+    # with a legitimate new group nowhere to go - the way out is the catalogue's `groups:`, where every
+    # product gets it.
     with pytest.raises(ValueError, match="bespoke") as exc:
         manifest.load(text, catalogue=catalogue.loads(_SHAPED))
-    assert "taxonomy" in str(exc.value)
+    assert "`groups:`" in str(exc.value)
 
 
 def test_a_product_adds_a_task_the_catalogue_never_heard_of_to_a_platform_group():
@@ -489,12 +491,92 @@ def test_a_catalogue_taxonomy_that_is_not_a_mapping_is_rejected():
         catalogue.loads("taxonomy: [build, test]\ntasks: {}\n")
 
 
-def test_the_shipped_catalogue_declares_the_ci_cd_loop():
-    # arrange / act: the real file - the loop every *ctl product inherits
+def test_the_shipped_catalogue_places_the_general_commands_and_nothing_that_needs_product_data():
+    # arrange: the real delivery.yaml, not a fixture - this is the assertion that the platform's own
+    # data obeys the rule the platform enforces
     cat = catalogue.load()
 
-    # assert
-    assert sorted(cat.taxonomy) == ["build", "deploy", "monitor", "release", "support", "tasks", "test"]
-    assert cat.taxonomy["deploy"]["env_first"] is True
-    assert "git" in cat.taxonomy["support"]["groups"]
+    # act
+    git = cat.groups["support"]["groups"]["git"]["commands"]
+    tasks = cat.groups["tasks"]["commands"]
+    placed = {spec["task"] for node in (git, tasks) for spec in node.values()}
 
+    # assert
+    assert set(git) == {"commit", "push", "prune-branches", "submodules"}
+    assert set(tasks) == {"catalogue", "generate"}
+    assert "support:nexus" not in placed and "test:gate" not in placed
+
+
+def test_the_shipped_catalogue_declares_the_whole_ci_cd_loop():
+    # arrange
+    cat = catalogue.load()
+
+    # act / assert: the shape every *ctl product inherits, and the two env-first groups
+    assert set(cat.groups) == {"build", "test", "release", "deploy", "monitor", "support", "tasks"}
+    assert cat.groups["deploy"]["env_first"] is True
+    assert cat.groups["monitor"]["env_first"] is True
+
+
+# --- the kernel's command tree (netctl#1469) -----------------------------------------------------------
+
+def test_the_catalogue_carries_the_command_tree_it_declares():
+    # arrange: a catalogue that declares a group with a command in it
+    text = """
+    tasks:
+      vcs:commit: { impl: delivery.tasks.vcs:commit, help: "commit." }
+    groups:
+      support:
+        help: "Host tooling."
+        groups:
+          git:
+            help: "Version-control helpers."
+            commands:
+              commit: { task: "vcs:commit" }
+    """
+
+    # act
+    cat = catalogue.loads(textwrap.dedent(text))
+
+    # assert
+    assert cat.groups["support"]["groups"]["git"]["commands"]["commit"] == {"task": "vcs:commit"}
+
+
+def test_a_catalogue_without_a_groups_block_carries_an_empty_tree():
+    # arrange: the shape every catalogue had before netctl#1469
+    text = 'tasks:\n  vcs:commit: { impl: delivery.tasks.vcs:commit, help: "commit." }\n'
+
+    # act
+    cat = catalogue.loads(text)
+
+    # assert
+    assert cat.groups == {}
+
+
+def test_a_groups_block_that_is_not_a_mapping_is_rejected():
+    # arrange
+    text = 'tasks:\n  vcs:commit: { impl: a:b, help: "h." }\ngroups: [build, test]\n'
+
+    # act / assert
+    with pytest.raises(ValueError, match="catalogue 'groups' must be a mapping"):
+        catalogue.loads(text)
+
+
+def test_an_old_form_product_still_cannot_invent_a_group_after_the_tree_moved():
+    # arrange: the netctl#1462 lock, now reading the tree instead of the deleted `taxonomy:` block. Not
+    # a hypothetical - Plan 1 Task 7 removed the block the lock used to read.
+    cat = catalogue.loads(textwrap.dedent("""
+        tasks:
+          vcs:push: { impl: delivery.tasks.vcs:push, help: "push it." }
+        groups:
+          build: { help: "Produce the artefacts." }
+    """))
+    old_form = textwrap.dedent("""
+        product: demo
+        groups:
+          wildwest:
+            yeehaw: { impl: "demo.cli:yeehaw", help: "ride." }
+    """)
+
+    # act / assert
+    with pytest.raises(ValueError, match="does not declare"):
+        manifest.load(old_form, catalogue=cat)
