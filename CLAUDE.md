@@ -35,9 +35,10 @@ src/consensus/                     Java lib block
 src/delivery/                      Python lib block
   src/python/delivery/             Python shared core
     orchestrator/                  steps runner + TUI + manifest assembly
-    tasks/                         product-agnostic CLI command impls a product's manifest points
-                                   `impl:` straight at (Typer callbacks; product data arrives via
-                                   delivery.context, never via an import of the product)
+    tasks/                         product-agnostic task bodies a task's `impl:` points straight at
+                                   (Typer callbacks; a command exists only in `groups:`, instantiating a
+                                   task by name - product data arrives via delivery.context, never via
+                                   an import of the product)
     (clitaxonomy, compose, environments, degraded, disk, diskguard, host, interact,
                                    labinstance, log, ports, run, vcs, waits)
   test/unit/python/                pytest unit tests (conftest.py adds the block's src/python to

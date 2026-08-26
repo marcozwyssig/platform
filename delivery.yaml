@@ -75,13 +75,20 @@ tasks:
     help: "git submodule update --init lib/platform (init the delivery-kernel submodule a fresh worktree needs)."
 
   # --- test: the suite runner ------------------------------------------------------------------------
-  # `gate` backs EVERY declared suite level: one body, several commands, each identifying itself by the
-  # name it was invoked as (netctl#1406). A product declares one entry per level and overrides the help,
-  # which is the case the shared-impl rule in delivery.taskgen exists for.
+  # `gate` backs EVERY declared suite level: one body, several commands, each pinning its own level with
+  # `with: { name: ... }` (netctl#1469 plan 2, replacing the old invocation-name trick of netctl#1406). A
+  # product declares one command per level, pins `name` and overrides the help, which is the case the
+  # shared-impl rule in delivery.taskgen exists for. A product that instantiates this WITHOUT a `name`
+  # pin gets a real, undocumented `--name` option and the body falls back to resolving the suite by
+  # invocation name (transitional, see `gate`'s own docstring) - `params.name` below only documents the
+  # option for that unpinned case; a command that pins it drops the presentation, since the value is off
+  # the command line (`treeform.resolve`).
   test:gate:
     impl: delivery.tasks.testrun:gate
     help: "Run a declared pytest suite against the running lab."
     passthrough_args: true
+    params:
+      name: { help: "the declared suite level to run (normally pinned per command with `with:`)" }
   test:report:
     impl: delivery.tasks.testrun:report_cmd
     help: "Merge the unit results into the shared Allure results and render the HTML archive."
