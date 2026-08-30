@@ -49,14 +49,23 @@ groups:
               remote:   { help: "also delete merged branches on origin" }
               unmerged: { help: "ALSO delete branches that cannot be proven merged (destructive)" }
           submodules: { task: "vcs:submodules" }
-  tasks:
-    help: "The task machinery itself: regenerate the CLI module, list the tasks."
-    commands:
-      catalogue: { task: "tasks:catalogue" }
-      generate:
-        task: "tasks:generate"
-        params:
-          check: { help: "report drift and write nothing" }
+      # tasks: the task machinery itself, NESTED under support for the same reason `git` is - it is host
+      # tooling for whoever develops the product, not a stage of the CI/CD loop the other six groups
+      # describe. A top-level `tasks` also claimed a very generic token beside `build`/`test`/`deploy`.
+      #
+      # The TASK COORDINATES are untouched: `tasks:catalogue` and `tasks:generate` keep their namespace,
+      # so `cat.namespaces()` and every product's `with:` pin are unaffected. What moves is the GROUP
+      # PATH - `<product> tasks generate` becomes `<product> support tasks generate` - and the hidden
+      # flat aliases (`<product> generate`, `<product> catalogue`) survive it exactly as the vcs verbs'
+      # did, because a flat alias is registered per unambiguous NAME, not per path.
+      tasks:
+        help: "The task machinery itself: regenerate the CLI module, list the tasks."
+        commands:
+          catalogue: { task: "tasks:catalogue" }
+          generate:
+            task: "tasks:generate"
+            params:
+              check: { help: "report drift and write nothing" }
 
 tasks:
 
