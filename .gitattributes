@@ -1,0 +1,3 @@
+# Batch files must keep CRLF: cmd.exe mis-parses multi-line blocks in an LF-only .cmd,
+# and git would otherwise hand Windows whatever the committing platform used.
+*.cmd text eol=crlf
