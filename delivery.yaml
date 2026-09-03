@@ -5,7 +5,7 @@
 # The kernel generates no module of its own - it has no CLI, only bodies and this registry. Only a
 # product generates, because only a product has a surface.
 #
-# Exactly the twelve coordinates netctl references today, no more. A catalogue that offers what nobody
+# Exactly the thirteen coordinates netctl references today, no more. A catalogue that offers what nobody
 # imports is speculation, and the design's own rule is the minimum that solves the problem.
 #
 # `help:` here is the fallback wording. A product's own `help:` wins where it declares one, and for a
@@ -116,6 +116,14 @@ tasks:
   support:environments:
     impl: delivery.tasks.env:environments
     help: "List the named environments and the backend each targets, marking the active one."
+
+  # --- docs: the documentation render ------------------------------------------------------------------
+  # Placed as a TASK, not as a command in the `build` group above: it needs the product's pinned image tag
+  # and a `docToolchainConfig.groovy` in the checkout, so a command declared here would die on its first
+  # line in a product that has neither. A product declares the command the day it has both.
+  docs:render:
+    impl: delivery.tasks.docs:render
+    help: "Render the project docs via docToolchain (generateHTML + generatePDF) in Docker."
 
   # --- tasks: the task machinery, addressable ---------------------------------------------------------
   # `generate` writes the product's committed CLI module; `catalogue` prints this file. Both are kernel
