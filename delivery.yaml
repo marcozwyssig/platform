@@ -98,6 +98,16 @@ tasks:
     passthrough_args: true
     params:
       name: { help: "the declared suite level to run (normally pinned per command with `with:`)" }
+  # The Python type gate. A product declares the command the day it has a ; the kernel carries
+  # the mechanism AND the tool (mypy is pinned in the kernel's requirements), so adopting it is one
+  # manifest line plus the config file that states what is covered.
+  test:typecheck-python:
+    impl: delivery.tasks.typecheck:check
+    help: "Type-check the product's Python sources with mypy, in the host venv (no Docker, no lab)."
+    params:
+      config:  { help: "path to the mypy configuration, relative to `workdir` (default mypy.ini)" }
+      workdir: { help: "directory mypy runs in, relative to the product root (default: the root)" }
+      python:  { help: "interpreter to run mypy with, relative to `workdir` (default: the host venv the CLI runs in)" }
   test:report:
     impl: delivery.tasks.testrun:report_cmd
     help: "Merge the unit results into the shared Allure results and render the HTML archive."
