@@ -5,22 +5,22 @@ family (netctl = network automation, infractl = IaaS/PaaS). Read this, then `REA
 
 ## What this is
 
-MECHANISM only: replication machinery (Raft wiring, mTLS, appliedIndex persistence), orchestrator
-engine (steps runner + TUI), CLI assembly (manifest-driven), and process/run/interaction seams.
+MECHANISM only: replication machinery — Raft wiring, mTLS material, appliedIndex persistence.
 Products ship their own data models. The invariant: **"gleiche Maschine, anderer Katalog"** — no
 product-specific data or models belong here. If a change requires product knowledge, it belongs in
 the product repo, not here.
 
-The rule runs in both directions (netctl#1280): an impl belongs HERE as soon as it needs no product
-knowledge, and a product forwarding function that only re-exports a kernel call is a shim, not a
-seam. Product data reaches such an impl through `delivery.context.current()` and the manifest, never
-through an import - `delivery/tasks/` holds the Typer callbacks a product's manifest points its
-`impl:` straight at.
+**The Python delivery kernel is no longer here.** It moved out with its history and lives at
+[github.com/marcozwyssig/simplon](https://github.com/marcozwyssig/simplon), where it is published to
+PyPI as `simplon` and consumed with `pip install simplon` + `simplon init <name>`. Anything about the
+orchestrator engine, CLI assembly, tasks or the `delivery` import package belongs in that repo, not
+in this one. Whether what is left should still be called "platform" is a question for the consensus
+work.
 
 ## HARD naming rule
 
-Python import package: `delivery`. NEVER `platform` — that name shadows the Python stdlib
-module. Java group: `info.zwyssig.platform`. Both are enforced in existing code; do not widen.
+Java group: `info.zwyssig.platform`. NEVER `platform` as a Python import package — that name shadows
+the Python stdlib module; the kernel's package is `simplon`, in its own repo.
 
 ## Layout
 
@@ -32,26 +32,14 @@ src/consensus/                     Java lib block
   src/java/                        Gradle module :consensus - Raft wiring, mTLS material,
                                    appliedIndex JPA persistence (standard src/main inside)
   test/unit/java/                  JUnit tests (+ resources/)
-src/delivery/                      Python lib block
-  src/python/delivery/             Python shared core
-    orchestrator/                  steps runner + TUI + manifest assembly
-    tasks/                         product-agnostic task bodies a task's `impl:` points straight at
-                                   (Typer callbacks; a command exists only in `groups:`, instantiating a
-                                   task by name - product data arrives via delivery.context, never via
-                                   an import of the product)
-    (clitaxonomy, compose, environments, degraded, disk, diskguard, host, interact,
-                                   labinstance, log, ports, run, vcs, waits)
-  test/unit/python/                pytest unit tests (conftest.py adds the block's src/python to
-                                   sys.path)
 ```
 
 ## Consumption model
 
-Both products vendor this repo as a **git submodule at `lib/platform`**:
-- Python: `lib/platform/src/delivery/src/python` prepended to `sys.path` (or `PYTHONPATH`) by
-  product conftest/shim.
-- Java: Gradle composite `includeBuild("lib/platform")` in the product's settings; module name
-  `:consensus` (group `info.zwyssig.platform`, artifact `consensus`).
+Both products vendor this repo as a **git submodule at `lib/platform`**, now for the Java side only:
+Gradle composite `includeBuild("lib/platform")` in the product's settings; module name `:consensus`
+(group `info.zwyssig.platform`, artifact `consensus`). The Python kernel is a PyPI dependency
+(`simplon==<version>` in the product's own requirements) and is never on a source path.
 
 Change discipline: **commit + push here FIRST**, then bump the submodule pointer in each consuming
 product (separate commits in netctl and infractl). Breaking changes require a coordinated pointer
@@ -66,9 +54,6 @@ Exhaustiveness is product-side and load-bearing. Do not seal `ReplicatedEvent` h
 ## Build and test
 
 ```
-# Python (run from repo root)
-python3 -m pytest src/delivery/test/unit/python -v
-
 # Java (no wrapper checked in; use a local Gradle or the docker gradle:jdk25 image)
 gradle :consensus:build             # compile + test the consensus module
 gradle :consensus:test              # tests only
